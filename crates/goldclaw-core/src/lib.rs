@@ -4,8 +4,8 @@ mod runtime;
 
 pub use error::{GoldClawError, Result};
 pub use models::{
-    AssistantEvent, ConversationRef, Envelope, EnvelopeSource, MessageRole, PolicyDecision,
-    RuntimeHealth, SessionBinding, SessionMessage, SessionSummary, SubmissionReceipt,
-    ToolInvocation, ToolOutput,
+    AssistantEvent, ConversationRef, Envelope, EnvelopeSource, MessageId, MessageRole,
+    PolicyDecision, RuntimeHealth, SessionBinding, SessionId, SessionMessage, SessionSummary,
+    SubmissionReceipt, ToolInvocation, ToolOutput,
 };
 pub use runtime::{Policy, Provider, RuntimeHandle, Tool};

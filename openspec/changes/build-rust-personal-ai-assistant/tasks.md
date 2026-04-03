@@ -2,7 +2,7 @@
 
 - [x] 1.1 创建 Rust workspace，并拆分 `goldclaw-core`、`goldclaw-config`、`goldclaw-store`、`goldclaw-runtime`、`goldclaw-gateway`、`goldclaw-doctor` 等基础 crate
 - [x] 1.2 建立 `goldclaw`、TUI、Web 三类应用入口和统一的版本管理方式
-- [ ] 1.3 接入基础依赖与开发工具链，包括 `tokio`、`serde`、`tracing`、`axum`、`clap`、`ratatui`、数据库迁移工具
+- [x] 1.3 接入基础依赖与开发工具链，包括 `tokio`、`serde`、`tracing`、`axum`、`clap`、`ratatui`、数据库迁移工具
 - [x] 1.4 定义核心领域模型、事件模型、错误模型和公共 trait
 - [ ] 1.5 建立基础 CI，包括格式化、lint、单元测试和 workspace 构建检查
 
@@ -21,7 +21,7 @@
 - [x] 3.3 定义工具调用接口、工具注册机制和工具执行上下文
 - [x] 3.4 建立统一 `Envelope` 输入结构和 `AssistantEvent` 输出结构
 - [x] 3.5 实现运行时事件总线和基础流式响应链路
-- [ ] 3.6 将关键运行时状态持久化到本地状态库，并验证重启恢复
+- [x] 3.6 将关键运行时状态持久化到本地状态库，并验证重启恢复
 
 ## 4. Gateway Daemon and Control Plane
 
@@ -91,7 +91,7 @@
 
 ## 12. Verification and Beta Readiness
 
-- [ ] 12.1 为运行时、配置、数据库和诊断模块编写单元测试
+- [x] 12.1 为运行时、配置、数据库和诊断模块编写单元测试
 - [ ] 12.2 为守护进程 API、事件流和多客户端并发访问编写集成测试
 - [ ] 12.3 为飞书、企业微信、微信连接器编写契约测试和失败恢复测试
 - [ ] 12.4 进行跨平台手工验收，覆盖首次安装、后台常驻、Web/TUI 切换和渠道收发

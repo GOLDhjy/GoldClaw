@@ -432,6 +432,7 @@ impl RuntimeHandle for InMemoryRuntime {
     async fn submit(&self, mut envelope: Envelope) -> Result<SubmissionReceipt> {
         let session = self.resolve_session(&envelope).await?;
         let session_id = session.id;
+        let envelope_id = envelope.id;
         let accepted_at = Utc::now();
 
         envelope.session_id = Some(session_id);
@@ -456,7 +457,7 @@ impl RuntimeHandle for InMemoryRuntime {
 
         Ok(SubmissionReceipt {
             session_id,
-            envelope_id: envelope.id,
+            envelope_id,
             accepted_at,
         })
     }

@@ -338,6 +338,15 @@ ORDER BY created_at ASC
                 )
             })?;
 
+            let metadata_raw: String = row.get(6)?;
+            let metadata = serde_json::from_str(&metadata_raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+
             Ok(SessionMessage {
                 id: parse_uuid(row.get::<_, String>(0)?)?,
                 session_id: parse_uuid(row.get::<_, String>(1)?)?,
@@ -345,7 +354,7 @@ ORDER BY created_at ASC
                 source,
                 content: row.get(4)?,
                 created_at: parse_datetime(row.get::<_, String>(5)?)?,
-                metadata: serde_json::from_str(&row.get::<_, String>(6)?)?,
+                metadata,
             })
         })?;
 
