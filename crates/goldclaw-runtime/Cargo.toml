@@ -9,6 +9,7 @@ publish = false
 async-trait.workspace = true
 chrono.workspace = true
 goldclaw-core = { path = "../goldclaw-core" }
+goldclaw-store = { path = "../goldclaw-store" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -1,14 +1,7 @@
-use std::path::PathBuf;
+mod layout;
+mod migrations;
+mod sqlite;
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SqliteStoreConfig {
-    pub path: PathBuf,
-}
-
-impl SqliteStoreConfig {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
-    }
-}
+pub use layout::{StoreLayout, StorePaths};
+pub use migrations::{MIGRATIONS, Migration, current_schema_version};
+pub use sqlite::{SqliteStore, StoreError, StoreInspection, StoreResult, StoreSnapshot};

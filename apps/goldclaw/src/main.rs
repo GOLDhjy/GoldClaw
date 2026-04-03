@@ -12,8 +12,10 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use dialoguer::Input;
 use goldclaw_config::{GatewaySettings, GoldClawConfig, ProjectPaths, RuntimeSettings};
+use goldclaw_doctor::{DoctorReport, HealthStatus, run_doctor};
 use goldclaw_gateway::{GatewayConfig, GatewayServer};
 use goldclaw_runtime::{EchoProvider, InMemoryRuntime, ReadWorkspaceTool, StaticPolicy};
+use goldclaw_store::{SqliteStore, StoreLayout, current_schema_version};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
@@ -29,6 +31,10 @@ enum Commands {
     Init {
         #[arg(long)]
         force: bool,
+    },
+    Doctor {
+        #[arg(long)]
+        json: bool,
     },
     Start,
     Stop,
@@ -62,6 +68,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { force } => init_config(force)?,
+        Commands::Doctor { json } => run_doctor_command(json)?,
         Commands::Start => start_gateway()?,
         Commands::Stop => stop_gateway()?,
         Commands::Status => show_status()?,
@@ -123,11 +130,40 @@ fn init_config(force: bool) -> Result<()> {
         },
     };
 
-    config.validate_loopback_bind()?;
+    let config = config.normalize()?;
     config.save(&config_path)?;
+    let store = StoreLayout::from_project_paths(&paths);
+    store.ensure_parent_dirs()?;
+    let sqlite = SqliteStore::open(store.clone())?;
 
     println!("GoldClaw 配置已写入: {}", config_path.display());
+    println!(
+        "SQLite 数据库路径: {}",
+        store.paths().database_file.display()
+    );
+    println!(
+        "已应用 schema 版本: {} / {}",
+        sqlite.applied_schema_version()?,
+        current_schema_version()
+    );
     println!("下一步可以运行 `goldclaw start` 启动后台服务。");
+    Ok(())
+}
+
+fn run_doctor_command(json: bool) -> Result<()> {
+    let paths = ProjectPaths::discover()?;
+    let report = run_doctor(&paths);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_doctor_report(&report);
+    }
+
+    if report.has_failures() {
+        std::process::exit(1);
+    }
+
     Ok(())
 }
 
@@ -135,6 +171,9 @@ fn start_gateway() -> Result<()> {
     let paths = ProjectPaths::discover()?;
     paths.ensure_all()?;
     let config = load_config(&paths)?;
+    let store = StoreLayout::from_project_paths(&paths);
+    store.ensure_parent_dirs()?;
+    let sqlite = SqliteStore::open(store.clone())?;
     config.validate_loopback_bind()?;
 
     if let Some(state) = load_runtime_state(&paths)? {
@@ -145,6 +184,13 @@ fn start_gateway() -> Result<()> {
             );
             return Ok(());
         }
+    }
+
+    if sqlite.has_pending_migrations()? {
+        bail!(
+            "database {} still has pending migrations after initialization",
+            store.paths().database_file.display()
+        );
     }
 
     let log_path = paths.gateway_log_file();
@@ -224,7 +270,9 @@ fn stop_gateway() -> Result<()> {
 fn show_status() -> Result<()> {
     let paths = ProjectPaths::discover()?;
     let config = load_config(&paths)?;
+    let store = StoreLayout::from_project_paths(&paths);
     let state = load_runtime_state(&paths)?;
+    let inspection = SqliteStore::inspect(&store)?;
 
     match state {
         Some(state) if port_open(&state.bind) => {
@@ -243,6 +291,15 @@ fn show_status() -> Result<()> {
             println!("status: stopped");
             println!("bind:   {}", config.gateway.bind);
         }
+    }
+    println!("db:     {}", store.paths().database_file.display());
+    if inspection.database_exists {
+        println!(
+            "schema: v{} / {}",
+            inspection.applied_schema_version, inspection.target_schema_version
+        );
+    } else {
+        println!("schema: v{}", current_schema_version());
     }
 
     Ok(())
@@ -273,11 +330,14 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
         config.runtime.read_roots.clone()
     };
 
-    let runtime = InMemoryRuntime::new(
+    let store = SqliteStore::open(StoreLayout::from_project_paths(&paths))?;
+    let runtime = InMemoryRuntime::with_store(
         std::sync::Arc::new(EchoProvider),
         std::sync::Arc::new(StaticPolicy::allow_only(["read_file"])),
         vec![std::sync::Arc::new(ReadWorkspaceTool::new(read_roots))],
-    );
+        store,
+    )
+    .await?;
 
     let gateway = GatewayServer::new(GatewayConfig {
         bind,
@@ -292,7 +352,7 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
 }
 
 fn load_config(paths: &ProjectPaths) -> Result<GoldClawConfig> {
-    GoldClawConfig::load(&paths.config_file()).map_err(|error| match error {
+    GoldClawConfig::load_resolved(&paths.config_file()).map_err(|error| match error {
         goldclaw_config::ConfigError::MissingConfig(_) => {
             anyhow!("GoldClaw 尚未初始化，请先运行 `goldclaw init`。")
         }
@@ -343,5 +403,28 @@ impl RuntimeStateGuard {
 impl Drop for RuntimeStateGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn print_doctor_report(report: &DoctorReport) {
+    println!("GoldClaw Doctor");
+    println!("generated_at: {}", report.generated_at);
+    println!(
+        "summary: {}",
+        if report.healthy {
+            "healthy"
+        } else {
+            "issues detected"
+        }
+    );
+
+    for check in &report.checks {
+        let marker = match check.status {
+            HealthStatus::Pass => "[ok]",
+            HealthStatus::Warn => "[warn]",
+            HealthStatus::Fail => "[fail]",
+        };
+        println!("{marker} {}: {}", check.id, check.summary);
+        println!("       {}", check.detail);
     }
 }

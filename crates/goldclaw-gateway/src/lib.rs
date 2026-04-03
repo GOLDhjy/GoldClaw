@@ -14,7 +14,8 @@ use axum::{
 };
 use futures_util::{StreamExt, stream::Stream};
 use goldclaw_core::{
-    AssistantEvent, Envelope, EnvelopeSource, GoldClawError, RuntimeHandle, SessionSummary,
+    AssistantEvent, ConversationRef, Envelope, EnvelopeSource, GoldClawError, RuntimeHandle,
+    SessionSummary,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -105,11 +106,12 @@ async fn submit_message(
     State(state): State<AppState>,
     Json(payload): Json<SubmitMessageRequest>,
 ) -> std::result::Result<Json<goldclaw_core::SubmissionReceipt>, ApiError> {
-    let envelope = Envelope::user(
+    let mut envelope = Envelope::user(
         payload.content,
         payload.source.unwrap_or(EnvelopeSource::Cli),
         payload.session_id,
     );
+    envelope.conversation = payload.conversation;
     Ok(Json(state.runtime.submit(envelope).await?))
 }
 
@@ -199,6 +201,7 @@ struct SubmitMessageRequest {
     session_id: Option<Uuid>,
     content: String,
     source: Option<EnvelopeSource>,
+    conversation: Option<ConversationRef>,
 }
 
 #[derive(Debug, Serialize)]

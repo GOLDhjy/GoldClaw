@@ -76,7 +76,7 @@
 
 **Decision:** 配置采用 `config.toml` + profile 覆盖 + 环境变量覆写的三层模型；敏感凭据默认保存在 OS keyring，配置文件只保存引用；本地状态使用 SQLite。
 
-**Rationale:** 该组合适合单机长期运行服务，既便于备份和迁移，也便于 `doctor` 做静态检查和一致性校验。SQLite 能承载会话索引、任务队列、事件日志和连接器状态。
+**Rationale:** 该组合适合单机长期运行服务，既便于备份和迁移，也便于 `doctor` 做静态检查和一致性校验。SQLite 能承载会话索引、session bindings、任务队列、事件日志和连接器状态。
 
 **Alternatives considered:**
 
@@ -93,6 +93,17 @@
 **Alternatives considered:**
 
 - 每个渠道维护独立消息模型：适配快，但核心逻辑会被迫为每个入口重复实现。
+
+### 5.1. 使用 `SessionResolver` 按来源上下文映射内部 session
+
+**Decision:** 内部仍保留 `session_id` 作为标准上下文容器，但外部入口不直接依赖它。所有入站 `Envelope` 都携带来源元数据，由 `SessionResolver` 按 `source_kind + source_instance + conversation_id` 映射到内部 session；CLI/TUI/Web 仍可显式选择或切换本地 session。
+
+**Rationale:** 这样既能保证飞书私聊、企业微信群、本地 CLI/Web 等入口的上下文独立，又能让 runtime 和队列层始终只处理统一的 `session_id`。来源世界和内部会话模型解耦后，后续新增渠道时不需要改变 runtime 核心流程。
+
+**Alternatives considered:**
+
+- 所有来源共享一个全局 messages 历史：实现简单，但不同来源会互相污染上下文。
+- 仅按来源种类分会话：仍无法区分不同私聊、群聊、thread 或本地窗口。
 
 ### 6. `init` 与 `doctor` 共享检查项注册表
 

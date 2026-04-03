@@ -20,3 +20,10 @@ The system SHALL persist session metadata, message history indexes, task queue m
 #### Scenario: Runtime restarts after prior activity
 - **WHEN** the gateway process restarts after at least one conversation has been handled
 - **THEN** the runtime can recover prior session listings and pending background work from the local store
+
+### Requirement: Source-aware session resolution
+The system SHALL resolve inbound messages from different surfaces and connectors into internal session identifiers based on source metadata and conversation context rather than requiring external clients to know internal session IDs.
+
+#### Scenario: Connector message arrives without internal session id
+- **WHEN** an inbound channel message includes source metadata and a conversation identifier but no internal session id
+- **THEN** the runtime resolves it to an existing internal session for that conversation or creates a new one and records the binding for future messages

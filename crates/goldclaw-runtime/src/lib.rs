@@ -8,10 +8,11 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use goldclaw_core::{
-    AssistantEvent, Envelope, EnvelopeSource, GoldClawError, Policy, PolicyDecision, Provider,
-    Result, RuntimeHandle, RuntimeHealth, SessionSummary, SubmissionReceipt, Tool, ToolInvocation,
-    ToolOutput,
+    AssistantEvent, Envelope, EnvelopeSource, GoldClawError, MessageRole, Policy, PolicyDecision,
+    Provider, Result, RuntimeHandle, RuntimeHealth, SessionBinding, SessionMessage, SessionSummary,
+    SubmissionReceipt, Tool, ToolInvocation, ToolOutput,
 };
+use goldclaw_store::{SqliteStore, StoreError};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{RwLock, broadcast};
@@ -24,7 +25,9 @@ pub struct InMemoryRuntime {
 
 struct RuntimeInner {
     sessions: RwLock<HashMap<Uuid, SessionState>>,
+    bindings: RwLock<HashMap<String, SessionBinding>>,
     channels: RwLock<HashMap<Uuid, broadcast::Sender<AssistantEvent>>>,
+    store: Option<SqliteStore>,
     provider: Arc<dyn Provider>,
     policy: Arc<dyn Policy>,
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -32,7 +35,7 @@ struct RuntimeInner {
 
 struct SessionState {
     summary: SessionSummary,
-    history: Vec<Envelope>,
+    history: Vec<SessionMessage>,
 }
 
 impl InMemoryRuntime {
@@ -40,6 +43,26 @@ impl InMemoryRuntime {
         provider: Arc<dyn Provider>,
         policy: Arc<dyn Policy>,
         tools: Vec<Arc<dyn Tool>>,
+    ) -> Self {
+        Self::build(provider, policy, tools, None)
+    }
+
+    pub async fn with_store(
+        provider: Arc<dyn Provider>,
+        policy: Arc<dyn Policy>,
+        tools: Vec<Arc<dyn Tool>>,
+        store: SqliteStore,
+    ) -> Result<Self> {
+        let runtime = Self::build(provider, policy, tools, Some(store.clone()));
+        runtime.restore_from_store(&store).await?;
+        Ok(runtime)
+    }
+
+    fn build(
+        provider: Arc<dyn Provider>,
+        policy: Arc<dyn Policy>,
+        tools: Vec<Arc<dyn Tool>>,
+        store: Option<SqliteStore>,
     ) -> Self {
         let tools = tools
             .into_iter()
@@ -49,12 +72,50 @@ impl InMemoryRuntime {
         Self {
             inner: Arc::new(RuntimeInner {
                 sessions: RwLock::new(HashMap::new()),
+                bindings: RwLock::new(HashMap::new()),
                 channels: RwLock::new(HashMap::new()),
+                store,
                 provider,
                 policy,
                 tools,
             }),
         }
+    }
+
+    async fn restore_from_store(&self, store: &SqliteStore) -> Result<()> {
+        let snapshot = store.load_snapshot().map_err(map_store_error)?;
+        let mut history_by_session: HashMap<Uuid, Vec<SessionMessage>> = HashMap::new();
+        for message in snapshot.messages {
+            history_by_session
+                .entry(message.session_id)
+                .or_default()
+                .push(message);
+        }
+
+        let sessions = snapshot
+            .sessions
+            .into_iter()
+            .map(|session| {
+                let history = history_by_session.remove(&session.id).unwrap_or_default();
+                (
+                    session.id,
+                    SessionState {
+                        summary: session,
+                        history,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let bindings = snapshot
+            .bindings
+            .into_iter()
+            .map(|binding| (binding.binding_key(), binding))
+            .collect::<HashMap<_, _>>();
+
+        self.inner.sessions.write().await.extend(sessions);
+        self.inner.bindings.write().await.extend(bindings);
+        Ok(())
     }
 
     async fn channel_for(&self, session_id: Uuid) -> broadcast::Sender<AssistantEvent> {
@@ -71,6 +132,45 @@ impl InMemoryRuntime {
     async fn emit(&self, session_id: Uuid, event: AssistantEvent) {
         let sender = self.channel_for(session_id).await;
         let _ = sender.send(event);
+    }
+
+    async fn append_message(&self, message: SessionMessage) -> Result<()> {
+        let summary = {
+            let mut sessions = self.inner.sessions.write().await;
+            let state = sessions.get_mut(&message.session_id).ok_or_else(|| {
+                GoldClawError::NotFound(format!("session `{}`", message.session_id))
+            })?;
+            state.summary.updated_at = message.created_at;
+            state.history.push(message.clone());
+            state.summary.clone()
+        };
+
+        self.persist_session(&summary)?;
+        self.persist_message(&message)?;
+        Ok(())
+    }
+
+    fn persist_session(&self, session: &SessionSummary) -> Result<()> {
+        if let Some(store) = &self.inner.store {
+            store.upsert_session(session).map_err(map_store_error)?;
+        }
+        Ok(())
+    }
+
+    fn persist_message(&self, message: &SessionMessage) -> Result<()> {
+        if let Some(store) = &self.inner.store {
+            store.append_message(message).map_err(map_store_error)?;
+        }
+        Ok(())
+    }
+
+    fn persist_binding(&self, binding: &SessionBinding) -> Result<()> {
+        if let Some(store) = &self.inner.store {
+            store
+                .upsert_session_binding(binding)
+                .map_err(map_store_error)?;
+        }
+        Ok(())
     }
 
     async fn process_envelope(&self, session_id: Uuid, envelope: Envelope) {
@@ -93,14 +193,93 @@ impl InMemoryRuntime {
         }
     }
 
+    async fn ensure_session_binding(
+        &self,
+        session: &SessionSummary,
+        envelope: &Envelope,
+    ) -> Result<()> {
+        let Some(binding_key) = envelope.binding_key() else {
+            return Ok(());
+        };
+        let Some(conversation) = envelope.conversation.as_ref() else {
+            return Ok(());
+        };
+
+        let binding = SessionBinding {
+            session_id: session.id,
+            source: envelope.source.clone(),
+            source_instance: conversation
+                .source_instance
+                .clone()
+                .unwrap_or_else(|| "default".into()),
+            conversation_id: conversation.conversation_id.clone(),
+            sender_id: conversation.sender_id.clone(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let to_persist = {
+            let mut bindings = self.inner.bindings.write().await;
+            let entry = bindings
+                .entry(binding_key)
+                .or_insert_with(|| binding.clone());
+            entry.session_id = binding.session_id;
+            entry.updated_at = binding.updated_at;
+            entry.sender_id = binding.sender_id.clone();
+            entry.source = binding.source.clone();
+            entry.source_instance = binding.source_instance.clone();
+            entry.conversation_id = binding.conversation_id.clone();
+            entry.clone()
+        };
+
+        self.persist_binding(&to_persist)?;
+        Ok(())
+    }
+
+    async fn resolve_session(&self, envelope: &Envelope) -> Result<SessionSummary> {
+        if let Some(session_id) = envelope.session_id {
+            let sessions = self.inner.sessions.read().await;
+            return sessions
+                .get(&session_id)
+                .map(|state| state.summary.clone())
+                .ok_or_else(|| GoldClawError::NotFound(format!("session `{session_id}`")));
+        }
+
+        if let Some(binding_key) = envelope.binding_key() {
+            let maybe_existing_id = {
+                let bindings = self.inner.bindings.read().await;
+                bindings.get(&binding_key).map(|binding| binding.session_id)
+            };
+
+            if let Some(session_id) = maybe_existing_id {
+                let sessions = self.inner.sessions.read().await;
+                if let Some(state) = sessions.get(&session_id) {
+                    return Ok(state.summary.clone());
+                }
+            }
+
+            let title = envelope
+                .conversation
+                .as_ref()
+                .map(auto_title_for_conversation)
+                .or_else(|| Some("New session".into()));
+            let session = self.create_session(title).await?;
+            self.ensure_session_binding(&session, envelope).await?;
+            return Ok(session);
+        }
+
+        self.create_session(None).await
+    }
+
     async fn run_provider(&self, session_id: Uuid, envelope: &Envelope) -> Result<()> {
         let content = self.inner.provider.generate(envelope).await?;
+        let completed_at = Utc::now();
         self.emit(
             session_id,
             AssistantEvent::MessageChunk {
                 session_id,
                 content: content.clone(),
-                at: Utc::now(),
+                at: completed_at,
             },
         )
         .await;
@@ -108,11 +287,22 @@ impl InMemoryRuntime {
             session_id,
             AssistantEvent::MessageCompleted {
                 session_id,
-                content,
-                at: Utc::now(),
+                content: content.clone(),
+                at: completed_at,
             },
         )
         .await;
+
+        self.append_message(SessionMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: MessageRole::Assistant,
+            source: envelope.source.clone(),
+            content,
+            metadata: json!({ "kind": "provider_response" }),
+            created_at: completed_at,
+        })
+        .await?;
         Ok(())
     }
 
@@ -154,13 +344,14 @@ impl InMemoryRuntime {
         .await;
 
         let output = tool.execute(&invocation).await?;
+        let completed_at = Utc::now();
         self.emit(
             session_id,
             AssistantEvent::ToolCompleted {
                 session_id,
                 tool_name: tool.name().into(),
                 output: output.clone(),
-                at: Utc::now(),
+                at: completed_at,
             },
         )
         .await;
@@ -168,11 +359,26 @@ impl InMemoryRuntime {
             session_id,
             AssistantEvent::MessageCompleted {
                 session_id,
-                content: output.content,
-                at: Utc::now(),
+                content: output.content.clone(),
+                at: completed_at,
             },
         )
         .await;
+
+        self.append_message(SessionMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: MessageRole::Tool,
+            source: EnvelopeSource::System,
+            content: output.content,
+            metadata: json!({
+                "kind": "tool_output",
+                "tool_name": tool.name(),
+                "summary": output.summary,
+            }),
+            created_at: completed_at,
+        })
+        .await?;
         Ok(())
     }
 }
@@ -199,6 +405,8 @@ impl RuntimeHandle for InMemoryRuntime {
             );
         }
 
+        self.persist_session(&session)?;
+
         self.emit(
             session.id,
             AssistantEvent::SessionCreated {
@@ -222,29 +430,21 @@ impl RuntimeHandle for InMemoryRuntime {
     }
 
     async fn submit(&self, mut envelope: Envelope) -> Result<SubmissionReceipt> {
-        let session_id = if let Some(existing) = envelope.session_id {
-            existing
-        } else {
-            self.create_session(None).await?.id
-        };
+        let session = self.resolve_session(&envelope).await?;
+        let session_id = session.id;
+        let accepted_at = Utc::now();
 
         envelope.session_id = Some(session_id);
-
-        {
-            let mut sessions = self.inner.sessions.write().await;
-            let state = sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| GoldClawError::NotFound(format!("session `{session_id}`")))?;
-            state.summary.updated_at = Utc::now();
-            state.history.push(envelope.clone());
-        }
+        self.ensure_session_binding(&session, &envelope).await?;
+        self.append_message(message_from_envelope(&envelope))
+            .await?;
 
         self.emit(
             session_id,
             AssistantEvent::MessageAccepted {
                 session_id,
                 envelope_id: envelope.id,
-                at: Utc::now(),
+                at: accepted_at,
             },
         )
         .await;
@@ -257,7 +457,7 @@ impl RuntimeHandle for InMemoryRuntime {
         Ok(SubmissionReceipt {
             session_id,
             envelope_id: envelope.id,
-            accepted_at: Utc::now(),
+            accepted_at,
         })
     }
 
@@ -272,6 +472,39 @@ impl RuntimeHandle for InMemoryRuntime {
             provider: self.inner.provider.name().into(),
             session_count: sessions.len(),
         })
+    }
+}
+
+fn message_from_envelope(envelope: &Envelope) -> SessionMessage {
+    SessionMessage {
+        id: envelope.id,
+        session_id: envelope.session_id.expect("resolved envelope session"),
+        role: MessageRole::User,
+        source: envelope.source.clone(),
+        content: envelope.content.clone(),
+        metadata: json!({
+            "envelope_id": envelope.id,
+            "conversation": &envelope.conversation,
+        }),
+        created_at: envelope.created_at,
+    }
+}
+
+fn map_store_error(error: StoreError) -> GoldClawError {
+    match error {
+        StoreError::Io(error) => GoldClawError::Io(error.to_string()),
+        StoreError::Sqlite(error) => GoldClawError::Internal(format!("sqlite error: {error}")),
+        StoreError::Json(error) => GoldClawError::InvalidInput(error.to_string()),
+        StoreError::InvalidData(message) => GoldClawError::Internal(message),
+        StoreError::LockPoisoned => GoldClawError::Internal("store lock poisoned".into()),
+    }
+}
+
+fn auto_title_for_conversation(conversation: &goldclaw_core::ConversationRef) -> String {
+    if let Some(sender_id) = &conversation.sender_id {
+        format!("{} ({sender_id})", conversation.conversation_id)
+    } else {
+        conversation.conversation_id.clone()
     }
 }
 
@@ -425,6 +658,7 @@ fn parse_read_command(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use goldclaw_store::{SqliteStore, StoreLayout};
     use std::{
         env, fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -457,5 +691,92 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn envelopes_with_same_binding_reuse_session() {
+        let runtime = InMemoryRuntime::new(
+            Arc::new(EchoProvider),
+            Arc::new(StaticPolicy::allow_only(["read_file"])),
+            vec![Arc::new(ReadWorkspaceTool::new(vec![
+                env::current_dir().unwrap(),
+            ]))],
+        );
+
+        let mut first = Envelope::user("hello", EnvelopeSource::Connector("feishu".into()), None);
+        first.conversation = Some(goldclaw_core::ConversationRef {
+            source_instance: Some("bot-main".into()),
+            conversation_id: "dm:user_123".into(),
+            sender_id: Some("user_123".into()),
+            external_message_id: Some("msg-1".into()),
+        });
+
+        let mut second = Envelope::user("again", EnvelopeSource::Connector("feishu".into()), None);
+        second.conversation = Some(goldclaw_core::ConversationRef {
+            source_instance: Some("bot-main".into()),
+            conversation_id: "dm:user_123".into(),
+            sender_id: Some("user_123".into()),
+            external_message_id: Some("msg-2".into()),
+        });
+
+        let first_receipt = runtime.submit(first).await.expect("first submit");
+        let second_receipt = runtime.submit(second).await.expect("second submit");
+
+        assert_eq!(first_receipt.session_id, second_receipt.session_id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_restores_bindings_across_runtime_restart() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock went backwards")
+            .as_nanos();
+        let database_file = env::temp_dir().join(format!("goldclaw-runtime-{unique}.sqlite3"));
+        let backup_dir = env::temp_dir().join(format!("goldclaw-runtime-backups-{unique}"));
+        let layout = StoreLayout::from_paths(database_file.clone(), backup_dir.clone());
+        let read_root = env::current_dir().expect("workspace dir");
+
+        let first_runtime = InMemoryRuntime::with_store(
+            Arc::new(EchoProvider),
+            Arc::new(StaticPolicy::allow_only(["read_file"])),
+            vec![Arc::new(ReadWorkspaceTool::new(vec![read_root.clone()]))],
+            SqliteStore::open(layout.clone()).expect("open sqlite store"),
+        )
+        .await
+        .expect("create runtime with store");
+
+        let mut first = Envelope::user("hello", EnvelopeSource::Connector("feishu".into()), None);
+        first.conversation = Some(goldclaw_core::ConversationRef {
+            source_instance: Some("bot-main".into()),
+            conversation_id: "dm:user_123".into(),
+            sender_id: Some("user_123".into()),
+            external_message_id: Some("msg-1".into()),
+        });
+
+        let first_receipt = first_runtime.submit(first).await.expect("first submit");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let second_runtime = InMemoryRuntime::with_store(
+            Arc::new(EchoProvider),
+            Arc::new(StaticPolicy::allow_only(["read_file"])),
+            vec![Arc::new(ReadWorkspaceTool::new(vec![read_root]))],
+            SqliteStore::open(layout.clone()).expect("reopen sqlite store"),
+        )
+        .await
+        .expect("restore runtime from store");
+
+        let mut second = Envelope::user("again", EnvelopeSource::Connector("feishu".into()), None);
+        second.conversation = Some(goldclaw_core::ConversationRef {
+            source_instance: Some("bot-main".into()),
+            conversation_id: "dm:user_123".into(),
+            sender_id: Some("user_123".into()),
+            external_message_id: Some("msg-2".into()),
+        });
+
+        let second_receipt = second_runtime.submit(second).await.expect("second submit");
+        assert_eq!(first_receipt.session_id, second_receipt.session_id);
+
+        let _ = fs::remove_file(database_file);
+        let _ = fs::remove_dir_all(backup_dir);
     }
 }

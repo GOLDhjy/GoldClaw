@@ -1,12 +1,13 @@
 use std::{
-    fs,
-    net::SocketAddr,
+    env, fs,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
@@ -26,6 +27,49 @@ pub enum ConfigError {
     InvalidSocketAddress(String),
     #[error("gateway bind address must stay on loopback, got `{0}`")]
     NonLoopbackBind(String),
+    #[error("origin `{0}` must use http or https")]
+    InvalidOriginScheme(String),
+    #[error("origin `{0}` must stay on localhost or loopback")]
+    NonLocalOrigin(String),
+    #[error("read root does not exist: {0}")]
+    MissingReadRoot(PathBuf),
+    #[error("read root is not a directory: {0}")]
+    InvalidReadRoot(PathBuf),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfigOverrides {
+    pub profile: Option<String>,
+    pub gateway_bind: Option<String>,
+    pub allowed_origins: Option<Vec<String>>,
+    pub read_roots: Option<Vec<PathBuf>>,
+}
+
+impl ConfigOverrides {
+    pub fn from_env() -> Self {
+        Self {
+            profile: env::var("GOLDCLAW_PROFILE")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            gateway_bind: env::var("GOLDCLAW_GATEWAY_BIND")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            allowed_origins: env::var("GOLDCLAW_ALLOWED_ORIGINS")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|origins| !origins.is_empty()),
+            read_roots: env::var_os("GOLDCLAW_READ_ROOTS")
+                .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+                .filter(|roots| !roots.is_empty()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -77,6 +121,13 @@ impl GoldClawConfig {
         Ok(toml::from_str(&raw)?)
     }
 
+    pub fn load_resolved(path: &Path) -> Result<Self> {
+        let config = Self::load(path)?;
+        config
+            .apply_overrides(ConfigOverrides::from_env())
+            .normalize()
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -101,6 +152,37 @@ impl GoldClawConfig {
         }
         Ok(())
     }
+
+    pub fn validate_allowed_origins(&self) -> Result<Vec<String>> {
+        normalize_origins(&self.gateway.allowed_origins)
+    }
+
+    pub fn resolve_read_roots(&self) -> Result<Vec<PathBuf>> {
+        normalize_read_roots(&self.runtime.read_roots)
+    }
+
+    pub fn apply_overrides(mut self, overrides: ConfigOverrides) -> Self {
+        if let Some(profile) = overrides.profile {
+            self.profile = profile;
+        }
+        if let Some(bind) = overrides.gateway_bind {
+            self.gateway.bind = bind;
+        }
+        if let Some(origins) = overrides.allowed_origins {
+            self.gateway.allowed_origins = origins;
+        }
+        if let Some(read_roots) = overrides.read_roots {
+            self.runtime.read_roots = read_roots;
+        }
+        self
+    }
+
+    pub fn normalize(mut self) -> Result<Self> {
+        self.validate_loopback_bind()?;
+        self.gateway.allowed_origins = self.validate_allowed_origins()?;
+        self.runtime.read_roots = self.resolve_read_roots()?;
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +201,10 @@ impl ProjectPaths {
         fs::create_dir_all(self.config_dir())?;
         fs::create_dir_all(self.data_dir())?;
         fs::create_dir_all(self.log_dir())?;
+        fs::create_dir_all(self.cache_dir())?;
+        fs::create_dir_all(self.temp_dir())?;
+        fs::create_dir_all(self.backup_dir())?;
+        fs::create_dir_all(self.database_dir())?;
         Ok(())
     }
 
@@ -134,6 +220,26 @@ impl ProjectPaths {
         self.data_dir().join("logs")
     }
 
+    pub fn cache_dir(&self) -> &Path {
+        self.dirs.cache_dir()
+    }
+
+    pub fn temp_dir(&self) -> PathBuf {
+        self.cache_dir().join("tmp")
+    }
+
+    pub fn backup_dir(&self) -> PathBuf {
+        self.data_dir().join("backups")
+    }
+
+    pub fn database_dir(&self) -> PathBuf {
+        self.data_dir().join("db")
+    }
+
+    pub fn database_file(&self) -> PathBuf {
+        self.database_dir().join("goldclaw.sqlite3")
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.config_dir().join("config.toml")
     }
@@ -144,5 +250,101 @@ impl ProjectPaths {
 
     pub fn gateway_log_file(&self) -> PathBuf {
         self.log_dir().join("gateway.log")
+    }
+}
+
+fn normalize_origins(origins: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::with_capacity(origins.len());
+    for origin in origins {
+        let parsed = Url::parse(origin).map_err(|_| ConfigError::NonLocalOrigin(origin.clone()))?;
+        match parsed.scheme() {
+            "http" | "https" => {}
+            _ => return Err(ConfigError::InvalidOriginScheme(origin.clone())),
+        }
+
+        let is_local = match parsed.host_str() {
+            Some("localhost") => true,
+            Some(host) => host
+                .parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false),
+            None => false,
+        };
+
+        if !is_local {
+            return Err(ConfigError::NonLocalOrigin(origin.clone()));
+        }
+
+        normalized.push(origin.clone());
+    }
+    Ok(normalized)
+}
+
+fn normalize_read_roots(read_roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut normalized = Vec::with_capacity(read_roots.len());
+    for root in read_roots {
+        if !root.exists() {
+            return Err(ConfigError::MissingReadRoot(root.clone()));
+        }
+        if !root.is_dir() {
+            return Err(ConfigError::InvalidReadRoot(root.clone()));
+        }
+        let canonical = fs::canonicalize(root)?;
+        if !normalized.contains(&canonical) {
+            normalized.push(canonical);
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn overrides_replace_runtime_and_gateway_settings() {
+        let config = GoldClawConfig::default().apply_overrides(ConfigOverrides {
+            profile: Some("work".into()),
+            gateway_bind: Some("127.0.0.1:9999".into()),
+            allowed_origins: Some(vec!["http://localhost:3000".into()]),
+            read_roots: Some(vec![PathBuf::from("."), PathBuf::from(".")]),
+        });
+
+        assert_eq!(config.profile, "work");
+        assert_eq!(config.gateway.bind, "127.0.0.1:9999");
+        assert_eq!(
+            config.gateway.allowed_origins,
+            vec!["http://localhost:3000"]
+        );
+        assert_eq!(config.runtime.read_roots.len(), 2);
+    }
+
+    #[test]
+    fn normalize_requires_local_origins_and_existing_roots() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock went backwards")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("goldclaw-config-{unique}"));
+        fs::create_dir_all(&root).expect("create temp dir");
+
+        let config = GoldClawConfig {
+            runtime: RuntimeSettings {
+                read_roots: vec![root.clone()],
+            },
+            gateway: GatewaySettings {
+                bind: "127.0.0.1:4263".into(),
+                allowed_origins: vec!["http://localhost:3000".into()],
+            },
+            ..GoldClawConfig::default()
+        }
+        .normalize()
+        .expect("config should normalize");
+
+        assert_eq!(
+            config.runtime.read_roots,
+            vec![fs::canonicalize(root).unwrap()]
+        );
     }
 }
