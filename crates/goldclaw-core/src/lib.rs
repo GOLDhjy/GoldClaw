@@ -8,4 +8,4 @@ pub use models::{
     PolicyDecision, RuntimeHealth, SessionBinding, SessionId, SessionMessage, SessionSummary,
     SubmissionReceipt, ToolInvocation, ToolOutput,
 };
-pub use runtime::{Policy, Provider, RuntimeHandle, Tool};
+pub use runtime::{Connector, Policy, Provider, RuntimeHandle, Tool};

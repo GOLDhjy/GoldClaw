@@ -11,9 +11,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use dialoguer::Input;
-use goldclaw_config::{GatewaySettings, GoldClawConfig, ProjectPaths, RuntimeSettings};
+use goldclaw_config::{AgentSettings, GatewaySettings, GoldClawConfig, ProjectPaths, ProviderSettings, RuntimeSettings};
 use goldclaw_doctor::{DoctorReport, HealthStatus, run_doctor};
 use goldclaw_gateway::{GatewayConfig, GatewayServer};
+use goldclaw_connector_stdin::StdinConnector;
+use goldclaw_core::Connector;
+use goldclaw_provider_glm::GlmProvider;
 use goldclaw_runtime::{EchoProvider, InMemoryRuntime, ReadWorkspaceTool, StaticPolicy};
 use goldclaw_store::{SqliteStore, StoreLayout, current_schema_version};
 use serde::{Deserialize, Serialize};
@@ -28,14 +31,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    Init {
-        #[arg(long)]
-        force: bool,
-    },
+    Init,
     Doctor {
         #[arg(long)]
         json: bool,
     },
+    Chat,
     Start,
     Stop,
     Status,
@@ -67,8 +68,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { force } => init_config(force)?,
+        Commands::Init => init_config(false)?,
         Commands::Doctor { json } => run_doctor_command(json)?,
+        Commands::Chat => chat_run().await?,
         Commands::Start => start_gateway()?,
         Commands::Stop => stop_gateway()?,
         Commands::Status => show_status()?,
@@ -88,45 +90,85 @@ fn init_tracing() {
         .try_init();
 }
 
-fn init_config(force: bool) -> Result<()> {
+fn init_config(_force: bool) -> Result<()> {
     let paths = ProjectPaths::discover()?;
     paths.ensure_all()?;
 
     let config_path = paths.config_file();
-    if config_path.exists() && !force {
-        println!("GoldClaw 已初始化: {}", config_path.display());
-        println!("如需重写配置，请使用 `goldclaw init --force`。");
-        return Ok(());
-    }
 
+    // Load existing config as defaults; fall back to built-in defaults if not yet initialized.
     let current_dir =
         std::env::current_dir().context("failed to determine current working directory")?;
-    let defaults = GoldClawConfig::default();
+    let existing = GoldClawConfig::load(&config_path).unwrap_or_default();
 
-    let profile: String = Input::new()
-        .with_prompt("Profile name")
-        .default(defaults.profile.clone())
+    println!("── 智能体 ──────────────────────────────");
+
+    let agent_name: String = Input::new()
+        .with_prompt("智能体名称")
+        .default(existing.agent.name.clone())
         .interact_text()?;
+
+    let personality: String = Input::new()
+        .with_prompt("性格 (留空跳过)")
+        .default(existing.agent.personality.clone())
+        .allow_empty(true)
+        .interact_text()?;
+
+    let style: String = Input::new()
+        .with_prompt("说话风格 (留空跳过)")
+        .default(existing.agent.style.clone())
+        .allow_empty(true)
+        .interact_text()?;
+
+    println!("\n── Provider ────────────────────────────");
+
+    let api_key: String = Input::new()
+        .with_prompt("BigModel API key (留空保持不变)")
+        .default(existing.provider.api_key.clone().unwrap_or_default())
+        .allow_empty(true)
+        .interact_text()?;
+
+    let api_key = api_key.trim().to_string();
+
+    println!("\n── 网关 ────────────────────────────────");
 
     let bind: String = Input::new()
         .with_prompt("Gateway bind address")
-        .default(defaults.gateway.bind.clone())
+        .default(existing.gateway.bind.clone())
         .interact_text()?;
+
+    let default_read_root = existing
+        .runtime
+        .read_roots
+        .first()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| current_dir.display().to_string());
 
     let read_root: String = Input::new()
-        .with_prompt("Primary read-only workspace root")
-        .default(current_dir.display().to_string())
+        .with_prompt("工作区根目录")
+        .default(default_read_root)
         .interact_text()?;
 
+    println!();
+
     let config = GoldClawConfig {
-        version: defaults.version,
-        profile,
+        version: existing.version,
+        profile: existing.profile.clone(),
+        agent: AgentSettings {
+            name: agent_name,
+            personality,
+            style,
+        },
         gateway: GatewaySettings {
             bind,
-            allowed_origins: defaults.gateway.allowed_origins,
+            allowed_origins: existing.gateway.allowed_origins,
         },
         runtime: RuntimeSettings {
             read_roots: vec![PathBuf::from(read_root)],
+        },
+        provider: ProviderSettings {
+            api_key: if api_key.is_empty() { None } else { Some(api_key) },
+            model: existing.provider.model,
         },
     };
 
@@ -305,6 +347,23 @@ fn show_status() -> Result<()> {
     Ok(())
 }
 
+fn build_provider(config: &GoldClawConfig) -> std::sync::Arc<dyn goldclaw_core::Provider> {
+    match GlmProvider::from_env_or_config(
+        config.provider.api_key.clone(),
+        config.provider.model.clone(),
+        config.agent.system_prompt(),
+    ) {
+        Ok(p) => {
+            tracing::info!("using GLM provider");
+            std::sync::Arc::new(p)
+        }
+        Err(reason) => {
+            tracing::warn!(%reason, "falling back to echo provider");
+            std::sync::Arc::new(EchoProvider)
+        }
+    }
+}
+
 async fn gateway_run(bind_override: Option<String>) -> Result<()> {
     let paths = ProjectPaths::discover()?;
     paths.ensure_all()?;
@@ -331,8 +390,9 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
     };
 
     let store = SqliteStore::open(StoreLayout::from_project_paths(&paths))?;
+    let provider = build_provider(&config);
     let runtime = InMemoryRuntime::with_store(
-        std::sync::Arc::new(EchoProvider),
+        provider,
         std::sync::Arc::new(StaticPolicy::allow_only(["read_file"])),
         vec![std::sync::Arc::new(ReadWorkspaceTool::new(read_roots))],
         store,
@@ -404,6 +464,32 @@ impl Drop for RuntimeStateGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+async fn chat_run() -> Result<()> {
+    let paths = ProjectPaths::discover()?;
+    paths.ensure_all()?;
+    let config = load_config(&paths)?;
+
+    let read_roots = if config.runtime.read_roots.is_empty() {
+        vec![std::env::current_dir().context("failed to determine current directory")?]
+    } else {
+        config.runtime.read_roots.clone()
+    };
+
+    let store = SqliteStore::open(StoreLayout::from_project_paths(&paths))?;
+    let provider = build_provider(&config);
+    let runtime = InMemoryRuntime::with_store(
+        provider,
+        std::sync::Arc::new(StaticPolicy::allow_only(["read_file"])),
+        vec![std::sync::Arc::new(ReadWorkspaceTool::new(read_roots))],
+        store,
+    )
+    .await?;
+
+    let connector = Box::new(StdinConnector::default());
+    connector.run(std::sync::Arc::new(runtime)).await?;
+    Ok(())
 }
 
 fn print_doctor_report(report: &DoctorReport) {

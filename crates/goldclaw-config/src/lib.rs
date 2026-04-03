@@ -73,11 +73,64 @@ impl ConfigOverrides {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentSettings {
+    /// Display name of the agent.
+    #[serde(default = "default_agent_name")]
+    pub name: String,
+    /// Personality description shown to the LLM as part of the system prompt.
+    #[serde(default)]
+    pub personality: String,
+    /// Speaking style instructions shown to the LLM as part of the system prompt.
+    #[serde(default)]
+    pub style: String,
+}
+
+fn default_agent_name() -> String {
+    "GoldClaw".into()
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            name: default_agent_name(),
+            personality: String::new(),
+            style: String::new(),
+        }
+    }
+}
+
+impl AgentSettings {
+    /// Build a system-prompt string from the agent settings.
+    /// Returns `None` if no meaningful content is set.
+    pub fn system_prompt(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.name.is_empty() {
+            parts.push(format!("你是{}。", self.name));
+        }
+        if !self.personality.is_empty() {
+            parts.push(self.personality.clone());
+        }
+        if !self.style.is_empty() {
+            parts.push(self.style.clone());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GoldClawConfig {
     pub version: u32,
     pub profile: String,
+    #[serde(default)]
+    pub agent: AgentSettings,
     pub gateway: GatewaySettings,
     pub runtime: RuntimeSettings,
+    #[serde(default)]
+    pub provider: ProviderSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,6 +146,16 @@ pub struct RuntimeSettings {
     pub read_roots: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProviderSettings {
+    /// BigModel (Zhipu AI) API key. Overridden by the `BIGMODEL_API_KEY` env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Model name, e.g. `GLM-5.1`. Overridden by the `BIGMODEL_MODEL` env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 fn default_allowed_origins() -> Vec<String> {
     vec!["http://127.0.0.1".into(), "http://localhost".into()]
 }
@@ -102,11 +165,13 @@ impl Default for GoldClawConfig {
         Self {
             version: 1,
             profile: "default".into(),
+            agent: AgentSettings::default(),
             gateway: GatewaySettings {
                 bind: "127.0.0.1:4263".into(),
                 allowed_origins: default_allowed_origins(),
             },
             runtime: RuntimeSettings::default(),
+            provider: ProviderSettings::default(),
         }
     }
 }
@@ -298,53 +363,4 @@ fn normalize_read_roots(read_roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn overrides_replace_runtime_and_gateway_settings() {
-        let config = GoldClawConfig::default().apply_overrides(ConfigOverrides {
-            profile: Some("work".into()),
-            gateway_bind: Some("127.0.0.1:9999".into()),
-            allowed_origins: Some(vec!["http://localhost:3000".into()]),
-            read_roots: Some(vec![PathBuf::from("."), PathBuf::from(".")]),
-        });
-
-        assert_eq!(config.profile, "work");
-        assert_eq!(config.gateway.bind, "127.0.0.1:9999");
-        assert_eq!(
-            config.gateway.allowed_origins,
-            vec!["http://localhost:3000"]
-        );
-        assert_eq!(config.runtime.read_roots.len(), 2);
-    }
-
-    #[test]
-    fn normalize_requires_local_origins_and_existing_roots() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock went backwards")
-            .as_nanos();
-        let root = env::temp_dir().join(format!("goldclaw-config-{unique}"));
-        fs::create_dir_all(&root).expect("create temp dir");
-
-        let config = GoldClawConfig {
-            runtime: RuntimeSettings {
-                read_roots: vec![root.clone()],
-            },
-            gateway: GatewaySettings {
-                bind: "127.0.0.1:4263".into(),
-                allowed_origins: vec!["http://localhost:3000".into()],
-            },
-            ..GoldClawConfig::default()
-        }
-        .normalize()
-        .expect("config should normalize");
-
-        assert_eq!(
-            config.runtime.read_roots,
-            vec![fs::canonicalize(root).unwrap()]
-        );
-    }
-}
+mod tests;
