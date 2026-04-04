@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use crate::{
-    AssistantEvent, ChatMessage, Envelope, GoldClawError, MemoryChunk, PolicyDecision, Result,
-    RuntimeHealth, SessionDetail, SessionMessage, SessionSummary, SubmissionReceipt, ToolInvocation,
-    ToolOutput,
+    AssistantEvent, ChatMessage, Envelope, GoldClawError, MemoryChunk, PolicyDecision,
+    ProviderOutput, Result, RuntimeHealth, SessionDetail, SessionMessage, SessionSummary,
+    SubmissionReceipt, ToolDefinition, ToolInvocation, ToolOutput,
 };
 
 pub trait MessageBuilder: Send + Sync {
@@ -16,7 +16,11 @@ pub trait MessageBuilder: Send + Sync {
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<String>;
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<ProviderOutput>;
 }
 
 #[async_trait]

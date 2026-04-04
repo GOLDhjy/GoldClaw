@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use goldclaw_core::{ChatMessage, EmbeddingProvider, GoldClawError, Provider, Result};
+use goldclaw_core::{
+    ChatMessage, EmbeddingProvider, GoldClawError, Provider, ProviderOutput, Result, ToolDefinition,
+};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -95,18 +97,88 @@ fn normalize_glm_model(model: &str) -> Option<String> {
     }
 }
 
+fn chat_message_to_api(m: &goldclaw_core::ChatMessage) -> ApiMessage {
+    ApiMessage {
+        role: m.role.clone(),
+        content: if m.tool_calls.is_empty() {
+            Some(m.content.clone())
+        } else {
+            None
+        },
+        tool_calls: m
+            .tool_calls
+            .iter()
+            .map(|tc| ApiToolCall {
+                id: tc.id.clone(),
+                call_type: tc.call_type.clone(),
+                function: ApiCallFunction {
+                    name: tc.function.name.clone(),
+                    arguments: tc.function.arguments.clone(),
+                },
+            })
+            .collect(),
+        tool_call_id: m.tool_call_id.clone(),
+    }
+}
+
+fn tool_definition_to_api(td: &goldclaw_core::ToolDefinition) -> ApiTool {
+    ApiTool {
+        tool_type: "function",
+        function: ApiToolFunction {
+            name: td.name.clone(),
+            description: td.description.clone(),
+            parameters: td.parameters.clone(),
+        },
+    }
+}
+
 // ── Wire types ────────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct ApiRequest<'a> {
     model: &'a str,
     messages: Vec<ApiMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ApiTool>,
 }
 
 #[derive(Serialize)]
 struct ApiMessage {
     role: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    tool_calls: Vec<ApiToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ApiTool {
+    #[serde(rename = "type")]
+    tool_type: &'static str,
+    function: ApiToolFunction,
+}
+
+#[derive(Serialize)]
+struct ApiToolFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ApiToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: String,
+    function: ApiCallFunction,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ApiCallFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +194,7 @@ struct ApiChoice {
 #[derive(Deserialize)]
 struct ApiChoiceMessage {
     content: Option<String>,
+    tool_calls: Option<Vec<ApiToolCall>>,
 }
 
 // ── Provider implementation ───────────────────────────────────────────────────
@@ -132,7 +205,11 @@ impl Provider for GlmProvider {
         "glm"
     }
 
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<ProviderOutput> {
         if messages.is_empty() {
             return Err(GoldClawError::InvalidInput(
                 "no messages to send to GLM".into(),
@@ -140,17 +217,18 @@ impl Provider for GlmProvider {
         }
 
         let base_url = base_url_from_env();
-        debug!(model = %self.model, base_url = %base_url, turns = messages.len(), "calling GLM API");
+        debug!(
+            model = %self.model,
+            base_url = %base_url,
+            turns = messages.len(),
+            tool_count = tools.len(),
+            "calling GLM API"
+        );
 
         let body = ApiRequest {
             model: &self.model,
-            messages: messages
-                .iter()
-                .map(|m| ApiMessage {
-                    role: m.role.clone(),
-                    content: m.content.clone(),
-                })
-                .collect(),
+            messages: messages.iter().map(chat_message_to_api).collect(),
+            tools: tools.iter().map(tool_definition_to_api).collect(),
         };
 
         let resp = self
@@ -175,12 +253,28 @@ impl Provider for GlmProvider {
             .await
             .map_err(|e| GoldClawError::Internal(format!("failed to parse GLM response: {e}")))?;
 
-        parsed
+        let msg = parsed
             .choices
             .into_iter()
             .next()
-            .and_then(|c| c.message.content)
+            .map(|c| c.message)
+            .ok_or_else(|| GoldClawError::Internal("GLM returned no choices".into()))?;
+
+        // Native tool call takes priority over text content.
+        if let Some(mut calls) = msg.tool_calls.filter(|v| !v.is_empty()) {
+            let call = calls.remove(0);
+            let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            return Ok(ProviderOutput::ToolCall {
+                id: call.id,
+                name: call.function.name,
+                args,
+            });
+        }
+
+        msg.content
             .filter(|s| !s.is_empty())
+            .map(ProviderOutput::Text)
             .ok_or_else(|| GoldClawError::Internal("GLM returned empty content".into()))
     }
 }

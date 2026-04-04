@@ -1,24 +1,28 @@
+pub mod tools;
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
 use async_trait::async_trait;
 use chrono::Utc;
 use goldclaw_core::{
-    AssistantEvent, ChatMessage, EmbeddingProvider, Envelope, EnvelopeSource, GoldClawError,
-    MemoryChunk, MemoryQuery, MemoryStore, MessageBuilder, MessageRole, Policy, PolicyDecision,
-    Provider, Result, RuntimeHandle, RuntimeHealth, SessionBinding, SessionDetail, SessionMessage,
-    SessionSummary, SubmissionReceipt, Tool, ToolInvocation, ToolOutput,
+    AssistantEvent, ChatFunction, ChatMessage, ChatToolCall, EmbeddingProvider, Envelope,
+    EnvelopeSource, GoldClawError, MemoryChunk, MemoryQuery, MemoryStore, MessageBuilder,
+    MessageRole, Policy, PolicyDecision, Provider, ProviderOutput, Result, RuntimeHandle,
+    RuntimeHealth, SessionBinding, SessionDetail, SessionMessage, SessionSummary,
+    SubmissionReceipt, ToolDefinition, ToolInvocation, ToolOutput,
 };
 use goldclaw_store::{SqliteStore, StoreError};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::sync::{RwLock, broadcast};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+use tools::BuiltinTool;
 
 #[derive(Clone)]
 pub struct InMemoryRuntime {
@@ -33,7 +37,7 @@ struct RuntimeInner {
     message_builder: Arc<dyn MessageBuilder>,
     provider: Arc<dyn Provider>,
     policy: Arc<dyn Policy>,
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn BuiltinTool>>,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     memory_store: Option<Arc<dyn MemoryStore>>,
 }
@@ -48,16 +52,36 @@ impl InMemoryRuntime {
         message_builder: Arc<dyn MessageBuilder>,
         provider: Arc<dyn Provider>,
         policy: Arc<dyn Policy>,
-        tools: Vec<Arc<dyn Tool>>,
+        tools: Vec<Arc<dyn BuiltinTool>>,
     ) -> Self {
         Self::build(message_builder, provider, policy, tools, None, None, None)
+    }
+
+    /// Sessions are in-memory only; only the shared memory store is persisted.
+    pub fn with_memory(
+        message_builder: Arc<dyn MessageBuilder>,
+        provider: Arc<dyn Provider>,
+        policy: Arc<dyn Policy>,
+        tools: Vec<Arc<dyn BuiltinTool>>,
+        embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+        memory_store: Option<Arc<dyn MemoryStore>>,
+    ) -> Self {
+        Self::build(
+            message_builder,
+            provider,
+            policy,
+            tools,
+            None,
+            embedding_provider,
+            memory_store,
+        )
     }
 
     pub async fn with_store(
         message_builder: Arc<dyn MessageBuilder>,
         provider: Arc<dyn Provider>,
         policy: Arc<dyn Policy>,
-        tools: Vec<Arc<dyn Tool>>,
+        tools: Vec<Arc<dyn BuiltinTool>>,
         store: SqliteStore,
     ) -> Result<Self> {
         Self::with_store_and_memory(message_builder, provider, policy, tools, store, None, None)
@@ -68,7 +92,7 @@ impl InMemoryRuntime {
         message_builder: Arc<dyn MessageBuilder>,
         provider: Arc<dyn Provider>,
         policy: Arc<dyn Policy>,
-        tools: Vec<Arc<dyn Tool>>,
+        tools: Vec<Arc<dyn BuiltinTool>>,
         store: SqliteStore,
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
         memory_store: Option<Arc<dyn MemoryStore>>,
@@ -90,7 +114,7 @@ impl InMemoryRuntime {
         message_builder: Arc<dyn MessageBuilder>,
         provider: Arc<dyn Provider>,
         policy: Arc<dyn Policy>,
-        tools: Vec<Arc<dyn Tool>>,
+        tools: Vec<Arc<dyn BuiltinTool>>,
         store: Option<SqliteStore>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
         memory_store: Option<Arc<dyn MemoryStore>>,
@@ -406,7 +430,14 @@ impl InMemoryRuntime {
     async fn run_provider(&self, session_id: Uuid, envelope: &Envelope) -> Result<()> {
         let memory_block = self.recall_memory(&envelope.content).await;
 
-        for _ in 0..4 {
+        let tool_defs: Vec<ToolDefinition> = self
+            .inner
+            .tools
+            .values()
+            .map(|t| t.tool_definition())
+            .collect();
+
+        for _ in 0..8 {
             let history = {
                 let sessions = self.inner.sessions.read().await;
                 sessions
@@ -425,54 +456,86 @@ impl InMemoryRuntime {
                 }
             }
 
-            let content = self.inner.provider.chat(&messages).await?;
-            if let Some(tool_call) = parse_assistant_tool_call(&content)? {
-                self.execute_tool(ToolInvocation {
-                    session_id,
-                    tool_name: tool_call.tool,
-                    source: EnvelopeSource::System,
-                    args: tool_call.args,
-                })
-                .await?;
-                continue;
+            for (i, msg) in messages.iter().enumerate() {
+                tracing::debug!(
+                    turn = i,
+                    role = %msg.role,
+                    tool_calls = msg.tool_calls.len(),
+                    "→ llm message"
+                );
             }
 
-            let completed_at = Utc::now();
-            self.emit(
-                session_id,
-                AssistantEvent::MessageChunk {
-                    session_id,
-                    content: content.clone(),
-                    at: completed_at,
-                },
-            )
-            .await;
-            self.emit(
-                session_id,
-                AssistantEvent::MessageCompleted {
-                    session_id,
-                    content: content.clone(),
-                    at: completed_at,
-                },
-            )
-            .await;
+            let output = self.inner.provider.chat(&messages, &tool_defs).await?;
 
-            self.append_message(SessionMessage {
-                id: Uuid::new_v4(),
-                session_id,
-                role: MessageRole::Assistant,
-                source: envelope.source.clone(),
-                content: content.clone(),
-                metadata: json!({ "kind": "provider_response" }),
-                created_at: completed_at,
-            })
-            .await?;
+            match output {
+                ProviderOutput::ToolCall { id, name, args } => {
+                    tracing::debug!(tool = %name, call_id = %id, "← llm tool call");
+                    let arguments = serde_json::to_string(&args).unwrap_or_default();
+                    self.append_message(SessionMessage {
+                        id: Uuid::new_v4(),
+                        session_id,
+                        role: MessageRole::Assistant,
+                        source: envelope.source.clone(),
+                        content: String::new(),
+                        metadata: json!({
+                            "kind": "tool_call",
+                            "tool_call_id": id,
+                            "tool_name": name,
+                            "arguments": arguments,
+                        }),
+                        created_at: Utc::now(),
+                    })
+                    .await?;
 
-            // Save memory chunk after response (best effort).
-            self.save_memory_chunk(session_id, &envelope.content, &content)
-                .await;
+                    self.execute_tool(ToolInvocation {
+                        session_id,
+                        tool_name: name,
+                        source: EnvelopeSource::System,
+                        args,
+                        tool_call_id: id,
+                    })
+                    .await?;
+                }
 
-            return Ok(());
+                ProviderOutput::Text(content) => {
+                    tracing::debug!(chars = content.chars().count(), "← llm text response");
+                    let completed_at = Utc::now();
+                    self.emit(
+                        session_id,
+                        AssistantEvent::MessageChunk {
+                            session_id,
+                            content: content.clone(),
+                            at: completed_at,
+                        },
+                    )
+                    .await;
+                    self.emit(
+                        session_id,
+                        AssistantEvent::MessageCompleted {
+                            session_id,
+                            content: content.clone(),
+                            at: completed_at,
+                        },
+                    )
+                    .await;
+
+                    self.append_message(SessionMessage {
+                        id: Uuid::new_v4(),
+                        session_id,
+                        role: MessageRole::Assistant,
+                        source: envelope.source.clone(),
+                        content: content.clone(),
+                        metadata: json!({ "kind": "provider_response" }),
+                        created_at: completed_at,
+                    })
+                    .await?;
+
+                    self.save_memory_chunk(session_id, &envelope.content, &content)
+                        .await;
+
+                    return Ok(());
+                }
+            }
         }
 
         Err(GoldClawError::Internal(
@@ -529,6 +592,7 @@ impl InMemoryRuntime {
             metadata: json!({
                 "kind": "tool_output",
                 "tool_name": tool.name(),
+                "tool_call_id": invocation.tool_call_id,
                 "summary": output.summary,
             }),
             created_at: completed_at,
@@ -549,6 +613,7 @@ impl InMemoryRuntime {
                 tool_name: "read_file".into(),
                 source: source.clone(),
                 args: json!({ "path": path }),
+                tool_call_id: "internal-read".into(),
             })
             .await?;
 
@@ -702,35 +767,12 @@ fn auto_title_for_conversation(conversation: &goldclaw_core::ConversationRef) ->
     }
 }
 
-const ASSISTANT_TOOL_CALL_OPEN: &str = "<tool_call>";
-const ASSISTANT_TOOL_CALL_CLOSE: &str = "</tool_call>";
-const LOCAL_ASSISTANT_RUNTIME_PROMPT: &str = r#"你运行在 GoldClaw 中。
+const RUNTIME_BASE_PROMPT: &str = "\
+你运行在 GoldClaw 中。
 
 下面的 [Active Soul] 是当前生效的人设文件，每次模型调用都会重新读取。
-如果用户要求修改你的人设、自我介绍、长期行为规则、回答风格、语气、格式习惯，或者其他持续生效的对话规则，你必须调用 `update_soul`，不能只在回复里口头答应。
-你已经能看到完整的当前 soul 文件内容，不需要先再读取一次才能修改。
-
-工具调用格式：你必须只输出下面这个 XML 块，不能输出其它文本：
-<tool_call>
-{"tool":"tool_name","args":{...}}
-</tool_call>
-
-工具执行后，你会基于最新上下文再次被调用，然后再正常回复用户。
-
-可用工具：
-- update_soul: {"content":"完整的新 soul.md 内容"}。你必须基于当前 [Active Soul] 生成修改后的完整全文，不要只传片段、补丁或说明文字。工具会把写入后的全文返回给你。
-- read_file: {"path":"相对或绝对路径"}。它会读取允许范围内的 UTF-8 文本文件。"#;
-
-#[derive(Deserialize)]
-struct AssistantToolCall {
-    tool: String,
-    #[serde(default = "default_tool_args")]
-    args: Value,
-}
-
-fn default_tool_args() -> Value {
-    json!({})
-}
+重要：如果用户要求修改你的人设、名字、称呼、语言、风格或任何长期规则，你必须调用 `update_soul` 工具，\
+绝对不能只口头答应却不调用工具——不调用等于没改。";
 
 pub struct StandardMessageBuilder {
     system_prompt: Option<String>,
@@ -739,15 +781,12 @@ pub struct StandardMessageBuilder {
 
 impl StandardMessageBuilder {
     pub fn new(system_prompt: Option<String>) -> Self {
-        Self {
-            system_prompt,
-            soul_path: None,
-        }
+        Self { system_prompt, soul_path: None }
     }
 
     pub fn with_soul_path(soul_path: PathBuf) -> Self {
         Self {
-            system_prompt: Some(LOCAL_ASSISTANT_RUNTIME_PROMPT.into()),
+            system_prompt: Some(RUNTIME_BASE_PROMPT.into()),
             soul_path: Some(soul_path),
         }
     }
@@ -770,11 +809,7 @@ impl StandardMessageBuilder {
             }
         }
 
-        if sections.is_empty() {
-            None
-        } else {
-            Some(sections.join("\n\n"))
-        }
+        if sections.is_empty() { None } else { Some(sections.join("\n\n")) }
     }
 }
 
@@ -783,10 +818,7 @@ impl MessageBuilder for StandardMessageBuilder {
         let mut messages: Vec<ChatMessage> = Vec::new();
 
         if let Some(prompt) = self.load_system_prompt() {
-            messages.push(ChatMessage {
-                role: "system".into(),
-                content: prompt,
-            });
+            messages.push(ChatMessage::text("system", prompt));
         }
 
         for msg in history {
@@ -795,19 +827,59 @@ impl MessageBuilder for StandardMessageBuilder {
             }
 
             messages.push(match msg.role {
-                MessageRole::System => ChatMessage {
-                    role: "system".into(),
-                    content: msg.content.clone(),
-                },
-                MessageRole::User => ChatMessage {
-                    role: "user".into(),
-                    content: msg.content.clone(),
-                },
-                MessageRole::Assistant => ChatMessage {
-                    role: "assistant".into(),
-                    content: msg.content.clone(),
-                },
-                MessageRole::Tool => format_tool_message(msg),
+                MessageRole::System => ChatMessage::text("system", msg.content.clone()),
+                MessageRole::User => ChatMessage::text("user", msg.content.clone()),
+                MessageRole::Assistant => {
+                    let kind = msg.metadata.get("kind").and_then(|v| v.as_str());
+                    if kind == Some("tool_call") {
+                        let tool_call_id = msg
+                            .metadata
+                            .get("tool_call_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let tool_name = msg
+                            .metadata
+                            .get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = msg
+                            .metadata
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}")
+                            .to_string();
+                        ChatMessage {
+                            role: "assistant".into(),
+                            content: String::new(),
+                            tool_calls: vec![ChatToolCall {
+                                id: tool_call_id,
+                                call_type: "function".into(),
+                                function: ChatFunction {
+                                    name: tool_name,
+                                    arguments,
+                                },
+                            }],
+                            tool_call_id: None,
+                        }
+                    } else {
+                        ChatMessage::text("assistant", msg.content.clone())
+                    }
+                }
+                MessageRole::Tool => {
+                    let tool_call_id = msg
+                        .metadata
+                        .get("tool_call_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    ChatMessage {
+                        role: "tool".into(),
+                        content: msg.content.clone(),
+                        tool_calls: vec![],
+                        tool_call_id,
+                    }
+                }
             });
         }
 
@@ -823,14 +895,14 @@ impl Provider for EchoProvider {
         "echo"
     }
 
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
+    async fn chat(&self, messages: &[ChatMessage], _tools: &[ToolDefinition]) -> Result<ProviderOutput> {
         let content = messages
             .iter()
             .rev()
             .find(|m| m.role == "user")
             .map(|m| m.content.as_str())
             .unwrap_or("");
-        Ok(format!("echo: {}", content.trim()))
+        Ok(ProviderOutput::Text(format!("echo: {}", content.trim())))
     }
 }
 
@@ -866,139 +938,6 @@ impl Policy for StaticPolicy {
     }
 }
 
-pub struct ReadWorkspaceTool {
-    roots: Vec<PathBuf>,
-    max_bytes: u64,
-}
-
-impl ReadWorkspaceTool {
-    pub fn new(roots: Vec<PathBuf>) -> Self {
-        Self {
-            roots,
-            max_bytes: 64 * 1024,
-        }
-    }
-
-    fn resolve_path(&self, path: &str) -> Result<PathBuf> {
-        let requested = PathBuf::from(path);
-        let candidate = if requested.is_absolute() {
-            requested
-        } else {
-            let base = self
-                .roots
-                .first()
-                .ok_or_else(|| GoldClawError::InvalidInput("no read roots configured".into()))?;
-            base.join(requested)
-        };
-
-        let canonical_target = fs::canonicalize(&candidate).map_err(|error| {
-            GoldClawError::Io(format!(
-                "failed to resolve `{}`: {error}",
-                candidate.display()
-            ))
-        })?;
-
-        let inside_root = self.roots.iter().any(|root| {
-            fs::canonicalize(root)
-                .map(|canonical_root| canonical_target.starts_with(canonical_root))
-                .unwrap_or(false)
-        });
-
-        if inside_root {
-            Ok(canonical_target)
-        } else {
-            Err(GoldClawError::Unauthorized(format!(
-                "path `{}` is outside configured read roots",
-                candidate.display()
-            )))
-        }
-    }
-
-    fn read_text_file(&self, path: &Path) -> Result<String> {
-        let metadata = fs::metadata(path)?;
-        if !metadata.is_file() {
-            return Err(GoldClawError::InvalidInput(format!(
-                "`{}` is not a regular file",
-                path.display()
-            )));
-        }
-        if metadata.len() > self.max_bytes {
-            return Err(GoldClawError::InvalidInput(format!(
-                "`{}` exceeds the {} byte limit",
-                path.display(),
-                self.max_bytes
-            )));
-        }
-
-        fs::read_to_string(path).map_err(|error| {
-            GoldClawError::Io(format!("failed to read `{}`: {error}", path.display()))
-        })
-    }
-}
-
-pub struct UpdateSoulTool {
-    soul_path: PathBuf,
-}
-
-impl UpdateSoulTool {
-    pub fn new(soul_path: PathBuf) -> Self {
-        Self { soul_path }
-    }
-}
-
-#[derive(Deserialize)]
-struct ReadArgs {
-    path: String,
-}
-
-#[derive(Deserialize)]
-struct UpdateSoulArgs {
-    content: String,
-}
-
-#[async_trait]
-impl Tool for ReadWorkspaceTool {
-    fn name(&self) -> &'static str {
-        "read_file"
-    }
-
-    async fn execute(&self, invocation: &ToolInvocation) -> Result<ToolOutput> {
-        let args: ReadArgs = serde_json::from_value(invocation.args.clone())?;
-        let path = self.resolve_path(&args.path)?;
-        let content = self.read_text_file(&path)?;
-        Ok(ToolOutput {
-            summary: format!("read {}", path.display()),
-            content,
-        })
-    }
-}
-
-#[async_trait]
-impl Tool for UpdateSoulTool {
-    fn name(&self) -> &'static str {
-        "update_soul"
-    }
-
-    async fn execute(&self, invocation: &ToolInvocation) -> Result<ToolOutput> {
-        let args: UpdateSoulArgs = serde_json::from_value(invocation.args.clone())?;
-        let content = normalize_soul_content(&args.content)?;
-
-        if let Some(parent) = self.soul_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&self.soul_path, content.as_bytes()).map_err(|error| {
-            GoldClawError::Io(format!(
-                "failed to write `{}`: {error}",
-                self.soul_path.display()
-            ))
-        })?;
-
-        Ok(ToolOutput {
-            summary: format!("updated {}", self.soul_path.display()),
-            content,
-        })
-    }
-}
 
 fn parse_read_command(content: &str) -> Option<String> {
     let trimmed = content.trim();
@@ -1010,34 +949,6 @@ fn parse_read_command(content: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn parse_assistant_tool_call(content: &str) -> Result<Option<AssistantToolCall>> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with(ASSISTANT_TOOL_CALL_OPEN) {
-        return Ok(None);
-    }
-    if !trimmed.ends_with(ASSISTANT_TOOL_CALL_CLOSE) {
-        return Err(GoldClawError::Internal(
-            "assistant emitted malformed tool call wrapper".into(),
-        ));
-    }
-
-    let payload =
-        &trimmed[ASSISTANT_TOOL_CALL_OPEN.len()..trimmed.len() - ASSISTANT_TOOL_CALL_CLOSE.len()];
-    let call: AssistantToolCall = serde_json::from_str(payload.trim()).map_err(|error| {
-        GoldClawError::Internal(format!(
-            "assistant emitted malformed tool call JSON: {error}"
-        ))
-    })?;
-
-    if call.tool.trim().is_empty() {
-        return Err(GoldClawError::Internal(
-            "assistant emitted tool call without a tool name".into(),
-        ));
-    }
-
-    Ok(Some(call))
-}
-
 fn is_legacy_soul_message(message: &SessionMessage) -> bool {
     message.role == MessageRole::System
         && message
@@ -1047,44 +958,6 @@ fn is_legacy_soul_message(message: &SessionMessage) -> bool {
             == Some("soul")
 }
 
-fn format_tool_message(message: &SessionMessage) -> ChatMessage {
-    let tool_name = message
-        .metadata
-        .get("tool_name")
-        .and_then(|value| value.as_str())
-        .unwrap_or("tool");
-    let summary = message
-        .metadata
-        .get("summary")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-
-    let mut content = format!("[Tool `{tool_name}` Result]");
-    if !summary.is_empty() {
-        content.push_str(&format!("\nSummary: {summary}"));
-    }
-    if !message.content.is_empty() {
-        content.push_str(&format!("\n{}", message.content));
-    }
-
-    ChatMessage {
-        role: "system".into(),
-        content,
-    }
-}
-
-fn normalize_soul_content(content: &str) -> Result<String> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return Err(GoldClawError::InvalidInput(
-            "soul content cannot be empty".into(),
-        ));
-    }
-
-    let mut normalized = trimmed.to_string();
-    normalized.push('\n');
-    Ok(normalized)
-}
 
 #[cfg(test)]
 mod tests;

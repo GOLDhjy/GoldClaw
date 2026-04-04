@@ -1,5 +1,5 @@
 use super::*;
-use goldclaw_core::MemoryStore;
+use goldclaw_core::{MemoryStore, ProviderOutput, ToolDefinition};
 use goldclaw_memory::SqliteMemoryStore;
 use goldclaw_store::{SqliteStore, StoreLayout};
 use std::{
@@ -7,6 +7,8 @@ use std::{
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
+use goldclaw_core::Tool;
+use tools::{BuiltinTool, ReadWorkspaceTool, UpdateSoulTool};
 
 fn temp_store_layout(unique: u128) -> StoreLayout {
     let database_file = env::temp_dir().join(format!("goldclaw-runtime-{unique}.sqlite3"));
@@ -24,15 +26,18 @@ impl Provider for SoulRefreshProvider {
         "soul-refresh"
     }
 
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
+    async fn chat(&self, messages: &[ChatMessage], _tools: &[ToolDefinition]) -> Result<ProviderOutput> {
         let mut calls = self.calls.lock().expect("call lock");
         *calls += 1;
 
         if *calls == 1 {
-            return Ok(
-                "<tool_call>\n{\"tool\":\"update_soul\",\"args\":{\"content\":\"# 角色设定\\n\\nINITIAL SOUL\\n\\n# 对话风格\\n\\n- 更冷静。\"}}\n</tool_call>"
-                    .into(),
-            );
+            return Ok(ProviderOutput::ToolCall {
+                id: "call-1".into(),
+                name: "update_soul".into(),
+                args: serde_json::json!({
+                    "content": "# 角色设定\n\nINITIAL SOUL\n\n# 对话风格\n\n- 更冷静。"
+                }),
+            });
         }
 
         let system_prompt = messages
@@ -42,7 +47,7 @@ impl Provider for SoulRefreshProvider {
             .unwrap_or_default();
 
         if system_prompt.contains("INITIAL SOUL") && system_prompt.contains("- 更冷静。") {
-            Ok("updated soul observed".into())
+            Ok(ProviderOutput::Text("updated soul observed".into()))
         } else {
             Err(GoldClawError::Internal(format!(
                 "updated soul missing from prompt: {system_prompt}"
@@ -52,32 +57,21 @@ impl Provider for SoulRefreshProvider {
 }
 
 #[tokio::test]
-async fn read_tool_rejects_escape() {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock went backwards")
-        .as_nanos();
-    let root = env::temp_dir().join(format!("goldclaw-runtime-{unique}"));
-    fs::create_dir_all(&root).expect("create temp root");
-
-    let tool = ReadWorkspaceTool::new(vec![root.clone()]);
+async fn read_tool_rejects_nonexistent_path() {
+    let tool = ReadWorkspaceTool::new(vec![env::temp_dir()]);
     let invocation = ToolInvocation {
         session_id: Uuid::new_v4(),
         tool_name: "read_file".into(),
         source: EnvelopeSource::Cli,
-        args: json!({ "path": "../../secret.txt" }),
+        args: json!({ "path": "/nonexistent/path/that/does/not/exist.txt" }),
+        tool_call_id: "test-call".into(),
     };
 
     let error = tool
         .execute(&invocation)
         .await
-        .expect_err("expected read to fail");
-    assert!(matches!(
-        error,
-        GoldClawError::Io(_) | GoldClawError::Unauthorized(_)
-    ));
-
-    let _ = fs::remove_dir_all(root);
+        .expect_err("expected read to fail for nonexistent file");
+    assert!(matches!(error, GoldClawError::Io(_)));
 }
 
 #[tokio::test]
@@ -426,17 +420,23 @@ async fn provider_can_update_soul_and_see_new_prompt_in_same_turn() {
     assert!(!soul.contains("- 偏热情。"));
 
     let detail = runtime.load_session(session.id).await.expect("load");
-    assert_eq!(detail.messages.len(), 3);
-    assert_eq!(detail.messages[1].role, MessageRole::Tool);
+    // messages: user, assistant (tool call), tool result, assistant (final)
+    assert_eq!(detail.messages.len(), 4);
+    assert_eq!(detail.messages[1].role, MessageRole::Assistant);
     assert_eq!(
-        detail.messages[1]
+        detail.messages[1].metadata.get("kind").and_then(|v| v.as_str()),
+        Some("tool_call")
+    );
+    assert_eq!(detail.messages[2].role, MessageRole::Tool);
+    assert_eq!(
+        detail.messages[2]
             .metadata
             .get("tool_name")
             .and_then(|value| value.as_str()),
         Some("update_soul")
     );
-    assert_eq!(detail.messages[2].role, MessageRole::Assistant);
-    assert_eq!(detail.messages[2].content, "updated soul observed");
+    assert_eq!(detail.messages[3].role, MessageRole::Assistant);
+    assert_eq!(detail.messages[3].content, "updated soul observed");
 
     let _ = fs::remove_file(soul_path);
     let _ = fs::remove_file(layout.paths().database_file.clone());
@@ -461,6 +461,7 @@ async fn update_soul_tool_writes_and_returns_full_content() {
         tool_name: "update_soul".into(),
         source: EnvelopeSource::System,
         args: json!({ "content": new_content }),
+        tool_call_id: "test-call".into(),
     };
 
     let output = tool.execute(&invocation).await.expect("update soul");

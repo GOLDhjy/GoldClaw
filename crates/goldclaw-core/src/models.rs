@@ -194,10 +194,52 @@ pub struct MemoryChunk {
     pub metadata: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tool_calls: Vec<ChatToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self { role: role.into(), content: content.into(), ..Default::default() }
+    }
+}
+
+/// A tool call emitted by the assistant inside a `ChatMessage`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ChatFunction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatFunction {
+    pub name: String,
+    /// Arguments serialised as a JSON string (OpenAI-compatible format).
+    pub arguments: String,
+}
+
+/// Describes a tool that the provider can call.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema object describing the `args` parameter.
+    pub parameters: serde_json::Value,
+}
+
+/// The output of a single provider turn — either a text reply or a tool call.
+#[derive(Clone, Debug)]
+pub enum ProviderOutput {
+    Text(String),
+    ToolCall { id: String, name: String, args: serde_json::Value },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,6 +255,8 @@ pub struct ToolInvocation {
     pub tool_name: String,
     pub source: EnvelopeSource,
     pub args: serde_json::Value,
+    /// Opaque ID assigned by the provider to correlate this call with its result.
+    pub tool_call_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -19,8 +19,8 @@ use goldclaw_gateway::{GatewayConfig, GatewayServer};
 use goldclaw_memory::SqliteMemoryStore;
 use goldclaw_provider_glm::GlmProvider;
 use goldclaw_runtime::{
-    EchoProvider, InMemoryRuntime, ReadWorkspaceTool, StandardMessageBuilder, StaticPolicy,
-    UpdateSoulTool,
+    EchoProvider, InMemoryRuntime, StandardMessageBuilder, StaticPolicy,
+    tools::{BuiltinTool, ReadWorkspaceTool, UpdateSoulTool},
 };
 use goldclaw_store::{SqliteStore, StoreLayout, current_schema_version};
 use serde::{Deserialize, Serialize};
@@ -609,11 +609,15 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
         config.runtime.read_roots.clone()
     };
 
-    let store = SqliteStore::open(StoreLayout::from_project_paths(&paths))?;
     let provider = build_provider(&config);
-    let message_builder = build_message_builder(&paths);
 
     let soul_path = paths.soul_path();
+
+    let builtin_tools: Vec<std::sync::Arc<dyn BuiltinTool>> = vec![
+        std::sync::Arc::new(ReadWorkspaceTool::new(read_roots)),
+        std::sync::Arc::new(UpdateSoulTool::new(soul_path.clone())),
+    ];
+    let message_builder = build_message_builder(&paths);
 
     let memory_store: Option<std::sync::Arc<dyn goldclaw_core::MemoryStore>> =
         SqliteMemoryStore::open(&paths.database_file())
@@ -628,22 +632,17 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
         soul_enabled = soul_path.exists(),
         embedding_enabled = embedding_provider.is_some(),
         memory_enabled = memory_store.is_some(),
-        "starting gateway runtime with memory features"
+        "starting gateway runtime (sessions: in-memory, memory: persisted)"
     );
 
-    let runtime = InMemoryRuntime::with_store_and_memory(
+    let runtime = InMemoryRuntime::with_memory(
         message_builder,
         provider,
         std::sync::Arc::new(StaticPolicy::allow_only(["read_file", "update_soul"])),
-        vec![
-            std::sync::Arc::new(ReadWorkspaceTool::new(read_roots)),
-            std::sync::Arc::new(UpdateSoulTool::new(soul_path.clone())),
-        ],
-        store,
+        builtin_tools,
         embedding_provider,
         memory_store,
-    )
-    .await?;
+    );
 
     let gateway = GatewayServer::new(GatewayConfig {
         bind,
