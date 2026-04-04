@@ -1,9 +1,17 @@
 use super::*;
+use goldclaw_core::MemoryStore;
+use goldclaw_memory::SqliteMemoryStore;
 use goldclaw_store::{SqliteStore, StoreLayout};
 use std::{
     env, fs,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+fn temp_store_layout(unique: u128) -> StoreLayout {
+    let database_file = env::temp_dir().join(format!("goldclaw-runtime-{unique}.sqlite3"));
+    let backup_dir = env::temp_dir().join(format!("goldclaw-runtime-backups-{unique}"));
+    StoreLayout::from_paths(database_file, backup_dir)
+}
 
 #[tokio::test]
 async fn read_tool_rejects_escape() {
@@ -153,4 +161,129 @@ async fn sqlite_store_restores_bindings_across_runtime_restart() {
 
     let _ = fs::remove_file(database_file);
     let _ = fs::remove_dir_all(backup_dir);
+}
+
+#[tokio::test]
+async fn soul_is_injected_as_system_message_on_session_creation() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    // Write a temp soul file.
+    let soul_path = env::temp_dir().join(format!("goldclaw-soul-{unique}.md"));
+    fs::write(&soul_path, "You are a helpful assistant.").unwrap();
+
+    let layout = temp_store_layout(unique + 1);
+    let store = SqliteStore::open(layout.clone()).expect("open store");
+
+    let runtime = InMemoryRuntime::with_store_and_memory(
+        Arc::new(StandardMessageBuilder::new(None)),
+        Arc::new(EchoProvider),
+        Arc::new(StaticPolicy::allow_only::<Vec<String>, String>(vec![])),
+        vec![],
+        store,
+        Some(soul_path.clone()),
+        None,
+        None,
+    )
+    .await
+    .expect("runtime");
+
+    let session = runtime.create_session(None).await.expect("session");
+    let detail = runtime.load_session(session.id).await.expect("load");
+
+    assert!(!detail.messages.is_empty(), "should have soul message");
+    assert_eq!(detail.messages[0].role, MessageRole::System);
+    assert_eq!(detail.messages[0].content, "You are a helpful assistant.");
+
+    let _ = fs::remove_file(soul_path);
+    let _ = fs::remove_file(layout.paths().database_file.clone());
+    let _ = fs::remove_dir_all(layout.paths().backup_dir.clone());
+}
+
+#[tokio::test]
+async fn memory_is_saved_after_provider_response() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        + 100;
+
+    let layout = temp_store_layout(unique);
+    let store = SqliteStore::open(layout.clone()).expect("open store");
+    let memory_store_impl =
+        SqliteMemoryStore::open(&layout.paths().database_file).expect("open memory store");
+    let memory_store: Arc<dyn MemoryStore> = Arc::new(memory_store_impl.clone());
+
+    let runtime = InMemoryRuntime::with_store_and_memory(
+        Arc::new(StandardMessageBuilder::new(None)),
+        Arc::new(EchoProvider),
+        Arc::new(StaticPolicy::allow_only::<Vec<String>, String>(vec![])),
+        vec![],
+        store,
+        None,
+        None,
+        Some(memory_store),
+    )
+    .await
+    .expect("runtime");
+
+    let session = runtime.create_session(None).await.expect("session");
+    runtime
+        .submit(Envelope::user("hello memory", EnvelopeSource::Cli, Some(session.id)))
+        .await
+        .expect("submit");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Check that a memory chunk was saved.
+    let chunks = memory_store_impl
+        .recall(goldclaw_core::MemoryQuery {
+            text: "hello memory".into(),
+            embedding: None,
+            limit: 5,
+        })
+        .await
+        .expect("recall");
+
+    assert!(!chunks.is_empty(), "should have saved a memory chunk");
+    assert!(chunks[0].content.contains("hello memory"));
+
+    let _ = fs::remove_file(layout.paths().database_file.clone());
+    let _ = fs::remove_dir_all(layout.paths().backup_dir.clone());
+}
+
+#[tokio::test]
+async fn no_soul_message_when_soul_file_missing() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        + 200;
+
+    let layout = temp_store_layout(unique);
+    let store = SqliteStore::open(layout.clone()).expect("open store");
+
+    let runtime = InMemoryRuntime::with_store_and_memory(
+        Arc::new(StandardMessageBuilder::new(None)),
+        Arc::new(EchoProvider),
+        Arc::new(StaticPolicy::allow_only::<Vec<String>, String>(vec![])),
+        vec![],
+        store,
+        Some(PathBuf::from("/nonexistent/soul.md")),
+        None,
+        None,
+    )
+    .await
+    .expect("runtime");
+
+    let session = runtime.create_session(None).await.expect("session");
+    let detail = runtime.load_session(session.id).await.expect("load");
+    assert!(
+        detail.messages.is_empty(),
+        "no system message when soul file missing"
+    );
+
+    let _ = fs::remove_file(layout.paths().database_file.clone());
+    let _ = fs::remove_dir_all(layout.paths().backup_dir.clone());
 }

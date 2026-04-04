@@ -180,6 +180,20 @@ fn default_message_metadata() -> serde_json::Value {
     serde_json::json!({})
 }
 
+pub type MemoryChunkId = Uuid;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryChunk {
+    pub id: MemoryChunkId,
+    pub session_id: Option<SessionId>,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "default_message_metadata")]
+    pub metadata: serde_json::Value,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,

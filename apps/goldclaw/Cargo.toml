@@ -14,6 +14,7 @@ goldclaw-config = { path = "../../crates/goldclaw-config" }
 goldclaw-connector-stdin = { path = "../../crates/goldclaw-connector-stdin" }
 goldclaw-core = { path = "../../crates/goldclaw-core" }
 goldclaw-doctor = { path = "../../crates/goldclaw-doctor" }
+goldclaw-memory = { path = "../../crates/goldclaw-memory" }
 goldclaw-gateway = { path = "../../crates/goldclaw-gateway" }
 goldclaw-provider-glm = { path = "../../crates/goldclaw-provider-glm" }
 goldclaw-runtime = { path = "../../crates/goldclaw-runtime" }

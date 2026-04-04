@@ -16,6 +16,7 @@ use goldclaw_config::{
 };
 use goldclaw_doctor::{DoctorReport, HealthStatus, run_doctor};
 use goldclaw_gateway::{GatewayConfig, GatewayServer};
+use goldclaw_memory::SqliteMemoryStore;
 use goldclaw_provider_glm::GlmProvider;
 use goldclaw_runtime::{
     EchoProvider, InMemoryRuntime, ReadWorkspaceTool, StandardMessageBuilder, StaticPolicy,
@@ -183,6 +184,22 @@ fn init_config(_force: bool) -> Result<()> {
 
     let config = config.normalize()?;
     config.save(&config_path)?;
+
+    let soul_path = paths.soul_path();
+    if !soul_path.exists() {
+        let soul_template = format!(
+            "# 角色设定\n\n你是 {}。{}\n\n# 说话风格\n\n{}\n\n# 关于用户\n\n<!-- 在这里补充用户的背景、偏好和习惯 -->\n",
+            config.agent.name,
+            config.agent.personality,
+            config.agent.style
+        );
+        fs::write(&soul_path, soul_template)
+            .with_context(|| format!("failed to write {}", soul_path.display()))?;
+        println!("Soul 文件已生成: {}", soul_path.display());
+    } else {
+        println!("Soul 文件已存在: {}", soul_path.display());
+    }
+
     let store = StoreLayout::from_project_paths(&paths);
     store.ensure_parent_dirs()?;
     let sqlite = SqliteStore::open(store.clone())?;
@@ -420,6 +437,18 @@ fn build_message_builder(
     std::sync::Arc::new(StandardMessageBuilder::new(config.agent.system_prompt()))
 }
 
+fn build_embedding_provider(
+    config: &GoldClawConfig,
+) -> Option<std::sync::Arc<dyn goldclaw_core::EmbeddingProvider>> {
+    match goldclaw_provider_glm::GlmProvider::from_env_or_config(
+        config.provider.api_key.clone(),
+        config.provider.model.clone(),
+    ) {
+        Ok(p) => Some(std::sync::Arc::new(p)),
+        Err(_) => None,
+    }
+}
+
 async fn gateway_run(bind_override: Option<String>) -> Result<()> {
     let paths = ProjectPaths::discover()?;
     paths.ensure_all()?;
@@ -448,12 +477,35 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
     let store = SqliteStore::open(StoreLayout::from_project_paths(&paths))?;
     let provider = build_provider(&config);
     let message_builder = build_message_builder(&config);
-    let runtime = InMemoryRuntime::with_store(
+
+    let soul_path = paths.soul_path();
+    let soul_path = if soul_path.exists() { Some(soul_path) } else { None };
+
+    let memory_store: Option<std::sync::Arc<dyn goldclaw_core::MemoryStore>> =
+        SqliteMemoryStore::open(&paths.database_file())
+            .ok()
+            .map(|s| std::sync::Arc::new(s) as std::sync::Arc<dyn goldclaw_core::MemoryStore>);
+
+    let embedding_provider: Option<std::sync::Arc<dyn goldclaw_core::EmbeddingProvider>> =
+        build_embedding_provider(&config);
+
+    tracing::info!(
+        bind = %config.gateway.bind,
+        soul_enabled = soul_path.is_some(),
+        embedding_enabled = embedding_provider.is_some(),
+        memory_enabled = memory_store.is_some(),
+        "starting gateway runtime with memory features"
+    );
+
+    let runtime = InMemoryRuntime::with_store_and_memory(
         message_builder,
         provider,
         std::sync::Arc::new(StaticPolicy::allow_only(["read_file"])),
         vec![std::sync::Arc::new(ReadWorkspaceTool::new(read_roots))],
         store,
+        soul_path,
+        embedding_provider,
+        memory_store,
     )
     .await?;
 

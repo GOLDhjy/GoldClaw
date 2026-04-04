@@ -97,6 +97,28 @@ ALTER TABLE messages
     ADD COLUMN role TEXT NOT NULL DEFAULT 'user';
 "#,
     },
+    Migration {
+        version: 4,
+        name: "add_memory_chunks",
+        sql: r#"
+CREATE TABLE IF NOT EXISTS memory_chunks (
+    id            TEXT PRIMARY KEY,
+    session_id    TEXT,
+    content       TEXT NOT NULL,
+    embedding     BLOB,
+    created_at    TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_chunks_created_at
+    ON memory_chunks(created_at DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    content,
+    chunk_id UNINDEXED
+);
+"#,
+    },
 ];
 
 pub const fn current_schema_version() -> u32 {

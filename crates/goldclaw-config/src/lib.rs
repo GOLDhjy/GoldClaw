@@ -319,6 +319,10 @@ impl ProjectPaths {
         self.base.join("gateway-state.json")
     }
 
+    pub fn soul_path(&self) -> PathBuf {
+        self.base.join("soul.md")
+    }
+
     pub fn gateway_log_file(&self) -> PathBuf {
         self.base.join("logs").join("gateway.log")
     }

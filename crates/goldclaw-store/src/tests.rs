@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use chrono::Utc;
@@ -29,7 +29,7 @@ mod migrations {
 
     #[test]
     fn schema_version_tracks_latest_migration() {
-        assert_eq!(current_schema_version(), 3);
+        assert_eq!(current_schema_version(), 4);
     }
 
     #[test]
@@ -42,21 +42,10 @@ mod migrations {
     }
 }
 
-fn temp_database_file() -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock went backwards")
-        .as_nanos();
-    env::temp_dir().join(format!("goldclaw-store-{unique}.sqlite3"))
-}
-
 fn temp_layout() -> StoreLayout {
-    let database_file = temp_database_file();
-    let backup_dir = database_file
-        .parent()
-        .expect("temp dir")
-        .join("goldclaw-store-backups");
-
+    let id = uuid::Uuid::new_v4();
+    let database_file = env::temp_dir().join(format!("goldclaw-store-{id}.sqlite3"));
+    let backup_dir = env::temp_dir().join(format!("goldclaw-store-backups-{id}"));
     StoreLayout::from_paths(database_file, backup_dir)
 }
 
@@ -67,7 +56,10 @@ mod sqlite {
     fn store_initializes_and_round_trips_runtime_state() {
         let layout = temp_layout();
         let store = SqliteStore::open(layout.clone()).expect("open store");
-        assert_eq!(store.applied_schema_version().expect("schema version"), 3);
+        assert_eq!(
+            store.applied_schema_version().expect("schema version"),
+            current_schema_version()
+        );
 
         let now = Utc::now();
         let session = SessionSummary {

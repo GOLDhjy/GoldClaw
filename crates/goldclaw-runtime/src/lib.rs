@@ -8,15 +8,16 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use goldclaw_core::{
-    AssistantEvent, ChatMessage, Envelope, EnvelopeSource, GoldClawError, MessageBuilder,
-    MessageRole, Policy, PolicyDecision, Provider, Result, RuntimeHandle, RuntimeHealth,
-    SessionBinding, SessionDetail, SessionMessage, SessionSummary, SubmissionReceipt, Tool,
-    ToolInvocation, ToolOutput,
+    AssistantEvent, ChatMessage, Envelope, EnvelopeSource, EmbeddingProvider, GoldClawError,
+    MemoryChunk, MemoryQuery, MemoryStore, MessageBuilder, MessageRole, Policy, PolicyDecision,
+    Provider, Result, RuntimeHandle, RuntimeHealth, SessionBinding, SessionDetail, SessionMessage,
+    SessionSummary, SubmissionReceipt, Tool, ToolInvocation, ToolOutput,
 };
 use goldclaw_store::{SqliteStore, StoreError};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{RwLock, broadcast};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -33,6 +34,9 @@ struct RuntimeInner {
     provider: Arc<dyn Provider>,
     policy: Arc<dyn Policy>,
     tools: HashMap<String, Arc<dyn Tool>>,
+    soul_path: Option<PathBuf>,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    memory_store: Option<Arc<dyn MemoryStore>>,
 }
 
 struct SessionState {
@@ -47,7 +51,7 @@ impl InMemoryRuntime {
         policy: Arc<dyn Policy>,
         tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
-        Self::build(message_builder, provider, policy, tools, None)
+        Self::build(message_builder, provider, policy, tools, None, None, None, None)
     }
 
     pub async fn with_store(
@@ -57,12 +61,28 @@ impl InMemoryRuntime {
         tools: Vec<Arc<dyn Tool>>,
         store: SqliteStore,
     ) -> Result<Self> {
+        Self::with_store_and_memory(message_builder, provider, policy, tools, store, None, None, None).await
+    }
+
+    pub async fn with_store_and_memory(
+        message_builder: Arc<dyn MessageBuilder>,
+        provider: Arc<dyn Provider>,
+        policy: Arc<dyn Policy>,
+        tools: Vec<Arc<dyn Tool>>,
+        store: SqliteStore,
+        soul_path: Option<PathBuf>,
+        embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+        memory_store: Option<Arc<dyn MemoryStore>>,
+    ) -> Result<Self> {
         let runtime = Self::build(
             message_builder,
             provider,
             policy,
             tools,
             Some(store.clone()),
+            soul_path,
+            embedding_provider,
+            memory_store,
         );
         runtime.restore_from_store(&store).await?;
         Ok(runtime)
@@ -74,6 +94,9 @@ impl InMemoryRuntime {
         policy: Arc<dyn Policy>,
         tools: Vec<Arc<dyn Tool>>,
         store: Option<SqliteStore>,
+        soul_path: Option<PathBuf>,
+        embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+        memory_store: Option<Arc<dyn MemoryStore>>,
     ) -> Self {
         let tools = tools
             .into_iter()
@@ -90,6 +113,9 @@ impl InMemoryRuntime {
                 provider,
                 policy,
                 tools,
+                soul_path,
+                embedding_provider,
+                memory_store,
             }),
         }
     }
@@ -160,6 +186,123 @@ impl InMemoryRuntime {
         self.persist_session(&summary)?;
         self.persist_message(&message)?;
         Ok(())
+    }
+
+    fn load_soul_message(
+        &self,
+        session_id: Uuid,
+        now: chrono::DateTime<Utc>,
+    ) -> Option<SessionMessage> {
+        let soul_path = self.inner.soul_path.as_ref()?;
+        let content = fs::read_to_string(soul_path).ok()?;
+        let content = content.trim().to_string();
+        if content.is_empty() {
+            return None;
+        }
+        Some(SessionMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: MessageRole::System,
+            source: EnvelopeSource::System,
+            content,
+            metadata: json!({ "kind": "soul" }),
+            created_at: now,
+        })
+    }
+
+    async fn recall_memory(&self, user_text: &str) -> Option<String> {
+        let memory_store = self.inner.memory_store.as_ref()?;
+
+        let embedding = if let Some(embedder) = &self.inner.embedding_provider {
+            match embedder.embed(user_text).await {
+                Ok(embedding) => {
+                    info!(
+                        embedding_dims = embedding.len(),
+                        query_chars = user_text.chars().count(),
+                        "memory query embedding generated"
+                    );
+                    Some(embedding)
+                }
+                Err(error) => {
+                    warn!("failed to embed memory query, falling back to text recall: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let chunks = match memory_store
+            .recall(MemoryQuery {
+                text: user_text.to_string(),
+                embedding,
+                limit: 5,
+            })
+            .await
+        {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                warn!("memory recall failed: {error}");
+                return None;
+            }
+        };
+
+        if chunks.is_empty() {
+            info!(query_chars = user_text.chars().count(), "memory recall returned no hits");
+            return None;
+        }
+        info!(
+            query_chars = user_text.chars().count(),
+            hits = chunks.len(),
+            "memory recall returned hits"
+        );
+
+        let lines: Vec<String> = chunks
+            .iter()
+            .map(|c| format!("- {}", c.content.replace('\n', " | ")))
+            .collect();
+
+        Some(format!("[Memory]\n{}", lines.join("\n")))
+    }
+
+    async fn save_memory_chunk(&self, session_id: Uuid, user_content: &str, assistant_reply: &str) {
+        let Some(memory_store) = &self.inner.memory_store else {
+            return;
+        };
+
+        let content = format!("User: {user_content}\nAssistant: {assistant_reply}");
+        let embedding = if let Some(embedder) = &self.inner.embedding_provider {
+            match embedder.embed(&content).await {
+                Ok(embedding) => {
+                    info!(
+                        session_id = %session_id,
+                        embedding_dims = embedding.len(),
+                        content_chars = content.chars().count(),
+                        "memory chunk embedding generated"
+                    );
+                    Some(embedding)
+                }
+                Err(error) => {
+                    warn!("failed to embed memory chunk, saving without embedding: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let chunk = MemoryChunk {
+            id: Uuid::new_v4(),
+            session_id: Some(session_id),
+            content,
+            embedding,
+            created_at: Utc::now(),
+            metadata: json!({}),
+        };
+        match memory_store.save_chunk(chunk).await {
+            Ok(()) => info!(session_id = %session_id, "memory chunk persisted"),
+            Err(error) => warn!("failed to save memory chunk: {error}"),
+        }
     }
 
     fn persist_session(&self, session: &SessionSummary) -> Result<()> {
@@ -291,7 +434,16 @@ impl InMemoryRuntime {
                 .map(|s| s.history.clone())
                 .unwrap_or_default()
         };
-        let messages = self.inner.message_builder.build(&history);
+
+        let mut messages = self.inner.message_builder.build(&history);
+
+        // Inject relevant memories into the last user message.
+        if let Some(memory_block) = self.recall_memory(&envelope.content).await {
+            if let Some(last_user) = messages.iter_mut().rfind(|m| m.role == "user") {
+                last_user.content = format!("{memory_block}\n\n[User Input]\n{}", last_user.content);
+            }
+        }
+
         let content = self.inner.provider.chat(&messages).await?;
         let completed_at = Utc::now();
         self.emit(
@@ -318,11 +470,15 @@ impl InMemoryRuntime {
             session_id,
             role: MessageRole::Assistant,
             source: envelope.source.clone(),
-            content,
+            content: content.clone(),
             metadata: json!({ "kind": "provider_response" }),
             created_at: completed_at,
         })
         .await?;
+
+        // Save memory chunk after response (best effort).
+        self.save_memory_chunk(session_id, &envelope.content, &content).await;
+
         Ok(())
     }
 
@@ -414,18 +570,27 @@ impl RuntimeHandle for InMemoryRuntime {
             updated_at: now,
         };
 
+        let soul_message = self.load_soul_message(session.id, now);
+
         {
             let mut sessions = self.inner.sessions.write().await;
+            let mut history = Vec::new();
+            if let Some(ref msg) = soul_message {
+                history.push(msg.clone());
+            }
             sessions.insert(
                 session.id,
                 SessionState {
                     summary: session.clone(),
-                    history: Vec::new(),
+                    history,
                 },
             );
         }
 
         self.persist_session(&session)?;
+        if let Some(msg) = soul_message {
+            self.persist_message(&msg)?;
+        }
 
         self.emit(
             session.id,

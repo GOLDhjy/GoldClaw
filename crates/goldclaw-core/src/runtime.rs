@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use crate::{
-    AssistantEvent, ChatMessage, Envelope, GoldClawError, PolicyDecision, Result, RuntimeHealth,
-    SessionDetail, SessionMessage, SessionSummary, SubmissionReceipt, ToolInvocation, ToolOutput,
+    AssistantEvent, ChatMessage, Envelope, GoldClawError, MemoryChunk, PolicyDecision, Result,
+    RuntimeHealth, SessionDetail, SessionMessage, SessionSummary, SubmissionReceipt, ToolInvocation,
+    ToolOutput,
 };
 
 pub trait MessageBuilder: Send + Sync {
@@ -49,6 +50,25 @@ pub trait RuntimeHandle: Send + Sync {
 pub trait Connector: Send {
     fn name(&self) -> &'static str;
     async fn run(self: Box<Self>, runtime: Arc<dyn RuntimeHandle>) -> Result<()>;
+}
+
+#[async_trait]
+pub trait EmbeddingProvider: Send + Sync {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+    fn dimension(&self) -> usize;
+    fn model_name(&self) -> &str;
+}
+
+pub struct MemoryQuery {
+    pub text: String,
+    pub embedding: Option<Vec<f32>>,
+    pub limit: usize,
+}
+
+#[async_trait]
+pub trait MemoryStore: Send + Sync {
+    async fn save_chunk(&self, chunk: MemoryChunk) -> Result<()>;
+    async fn recall(&self, query: MemoryQuery) -> Result<Vec<MemoryChunk>>;
 }
 
 impl From<serde_json::Error> for GoldClawError {

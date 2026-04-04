@@ -2,6 +2,13 @@ use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn soul_path_is_under_base_dir() {
+    let base = PathBuf::from("/home/user/.goldclaw");
+    let paths = ProjectPaths { base: base.clone() };
+    assert_eq!(paths.soul_path(), base.join("soul.md"));
+}
+
+#[test]
 fn overrides_replace_runtime_and_gateway_settings() {
     let config = GoldClawConfig::default().apply_overrides(ConfigOverrides {
         profile: Some("work".into()),

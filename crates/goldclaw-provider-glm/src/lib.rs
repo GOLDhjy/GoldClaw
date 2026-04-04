@@ -1,10 +1,13 @@
 use async_trait::async_trait;
-use goldclaw_core::{ChatMessage, GoldClawError, Provider, Result};
+use goldclaw_core::{ChatMessage, EmbeddingProvider, GoldClawError, Provider, Result};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 const DEFAULT_MODEL: &str = "GLM-5.1";
 const DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+const EMBEDDING_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+const EMBEDDING_MODEL: &str = "embedding-3";
+const EMBEDDING_DIMENSION: usize = 2048;
 
 pub struct GlmProvider {
     client: reqwest::Client,
@@ -182,6 +185,80 @@ impl Provider for GlmProvider {
     }
 }
 
+// ── Embedding wire types ──────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct EmbeddingRequest<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingData>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingData {
+    embedding: Vec<f32>,
+}
+
+// ── EmbeddingProvider implementation ─────────────────────────────────────────
+
+#[async_trait]
+impl EmbeddingProvider for GlmProvider {
+    fn dimension(&self) -> usize {
+        EMBEDDING_DIMENSION
+    }
+
+    fn model_name(&self) -> &str {
+        EMBEDDING_MODEL
+    }
+
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        let base_url = std::env::var("BIGMODEL_EMBEDDING_BASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| EMBEDDING_BASE_URL.to_string());
+
+        debug!(model = EMBEDDING_MODEL, "calling GLM embedding API");
+
+        let body = EmbeddingRequest {
+            model: EMBEDDING_MODEL,
+            input: text,
+        };
+
+        let resp = self
+            .client
+            .post(format!("{base_url}/embeddings"))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| GoldClawError::Internal(format!("GLM embedding request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(GoldClawError::Internal(format!(
+                "GLM embedding API error {status}: {text}"
+            )));
+        }
+
+        let parsed: EmbeddingResponse = resp.json().await.map_err(|e| {
+            GoldClawError::Internal(format!("failed to parse GLM embedding response: {e}"))
+        })?;
+
+        parsed
+            .data
+            .into_iter()
+            .next()
+            .map(|d| d.embedding)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| GoldClawError::Internal("GLM returned empty embedding".into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +286,23 @@ mod tests {
     #[test]
     fn default_model_is_glm_5_1() {
         assert_eq!(DEFAULT_MODEL, "GLM-5.1");
+    }
+
+    #[test]
+    fn embedding_constants_are_sane() {
+        assert_eq!(EMBEDDING_MODEL, "embedding-3");
+        assert_eq!(EMBEDDING_DIMENSION, 2048);
+        assert!(EMBEDDING_BASE_URL.starts_with("https://"));
+    }
+
+    #[test]
+    fn embedding_dimension_matches_provider() {
+        let provider = GlmProvider {
+            client: reqwest::Client::new(),
+            model: DEFAULT_MODEL.into(),
+            api_key: "test-key".into(),
+        };
+        assert_eq!(provider.dimension(), EMBEDDING_DIMENSION);
+        assert_eq!(provider.model_name(), EMBEDDING_MODEL);
     }
 }
