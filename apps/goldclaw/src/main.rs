@@ -20,6 +20,7 @@ use goldclaw_memory::SqliteMemoryStore;
 use goldclaw_provider_glm::GlmProvider;
 use goldclaw_runtime::{
     EchoProvider, InMemoryRuntime, ReadWorkspaceTool, StandardMessageBuilder, StaticPolicy,
+    UpdateSoulTool,
 };
 use goldclaw_store::{SqliteStore, StoreLayout, current_schema_version};
 use serde::{Deserialize, Serialize};
@@ -107,32 +108,28 @@ fn init_config(_force: bool) -> Result<()> {
         std::env::current_dir().context("failed to determine current working directory")?;
     let existing = GoldClawConfig::load(&config_path).unwrap_or_default();
 
-    println!("── 智能体 ──────────────────────────────");
+    let soul_path = paths.soul_path();
+    let existing_soul = fs::read_to_string(&soul_path).unwrap_or_default();
+    let soul_answers = parse_soul_answers(&existing_soul, &existing.agent.name);
 
-    let agent_name: String = Input::new()
-        .with_prompt("智能体名称")
-        .default(existing.agent.name.clone())
-        .interact_text()?;
+    println!("── 使用偏好 ────────────────────────────");
 
-    let personality: String = Input::new()
-        .with_prompt("性格 (留空跳过)")
-        .default(existing.agent.personality.clone())
-        .allow_empty(true)
-        .interact_text()?;
+    let user_name = prompt_text("助手如何称呼你", Some(soul_answers.user_name), true)?;
 
-    let style: String = Input::new()
-        .with_prompt("说话风格 (留空跳过)")
-        .default(existing.agent.style.clone())
-        .allow_empty(true)
-        .interact_text()?;
+    let assistant_name = prompt_text("助手的名字", Some(soul_answers.assistant_name), true)?;
 
-    println!("\n── Provider ────────────────────────────");
+    let language = prompt_text("默认回复语言（默认普通话）", Some(soul_answers.language), true)?;
 
-    let api_key: String = Input::new()
-        .with_prompt("BigModel API key (留空保持不变)")
-        .default(existing.provider.api_key.clone().unwrap_or_default())
-        .allow_empty(true)
-        .interact_text()?;
+    let conversation_style =
+        prompt_text("对话风格", Some(soul_answers.conversation_style), true)?;
+
+    println!("── Provider ────────────────────────────");
+
+    let api_key = prompt_text(
+        "BigModel API key (留空保持不变)",
+        existing.provider.api_key.clone(),
+        true,
+    )?;
 
     let api_key = api_key.trim().to_string();
 
@@ -161,9 +158,13 @@ fn init_config(_force: bool) -> Result<()> {
         version: existing.version,
         profile: existing.profile.clone(),
         agent: AgentSettings {
-            name: agent_name,
-            personality,
-            style,
+            name: if assistant_name.trim().is_empty() {
+                existing.agent.name.clone()
+            } else {
+                assistant_name.trim().to_string()
+            },
+            personality: String::new(),
+            style: String::new(),
         },
         gateway: GatewaySettings {
             bind,
@@ -185,20 +186,18 @@ fn init_config(_force: bool) -> Result<()> {
     let config = config.normalize()?;
     config.save(&config_path)?;
 
-    let soul_path = paths.soul_path();
-    if !soul_path.exists() {
-        let soul_template = format!(
-            "# 角色设定\n\n你是 {}。{}\n\n# 说话风格\n\n{}\n\n# 关于用户\n\n<!-- 在这里补充用户的背景、偏好和习惯 -->\n",
-            config.agent.name,
-            config.agent.personality,
-            config.agent.style
-        );
-        fs::write(&soul_path, soul_template)
-            .with_context(|| format!("failed to write {}", soul_path.display()))?;
-        println!("Soul 文件已生成: {}", soul_path.display());
-    } else {
-        println!("Soul 文件已存在: {}", soul_path.display());
-    }
+    let soul = build_soul_content(
+        &config.agent.name,
+        &SoulAnswers {
+            user_name,
+            assistant_name: config.agent.name.clone(),
+            language,
+            conversation_style,
+        },
+    )?;
+    fs::write(&soul_path, soul.as_bytes())
+        .with_context(|| format!("failed to write {}", soul_path.display()))?;
+    println!("Soul 文件已更新: {}", soul_path.display());
 
     let store = StoreLayout::from_project_paths(&paths);
     store.ensure_parent_dirs()?;
@@ -224,6 +223,142 @@ fn init_config(_force: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SoulAnswers {
+    user_name: String,
+    assistant_name: String,
+    language: String,
+    conversation_style: String,
+}
+
+fn default_soul_answers(agent_name: &str) -> SoulAnswers {
+    SoulAnswers {
+        user_name: String::new(),
+        assistant_name: if agent_name.trim().is_empty() {
+            "GoldClaw".into()
+        } else {
+            agent_name.trim().into()
+        },
+        language: "普通话".into(),
+        conversation_style: String::new(),
+    }
+}
+
+fn build_soul_content(agent_name: &str, answers: &SoulAnswers) -> Result<String> {
+    let agent_name = if agent_name.trim().is_empty() {
+        "GoldClaw"
+    } else {
+        agent_name.trim()
+    };
+    let user_name = section_value(&answers.user_name, "未指定，必要时先问清楚用户希望的称呼。");
+    let language = section_value(&answers.language, "普通话");
+    let conversation_style = section_value(
+        &answers.conversation_style,
+        "默认使用清晰、直接、务实的表达，优先给出结论和下一步。",
+    );
+
+    normalize_soul_content(&format!(
+        "# 助手身份\n\n你是 {agent_name}，一个本地 AI 助手。你需要长期根据下面的信息调整自己的表达和协作方式。\n\n# 助手名字\n\n{agent_name}\n\n# 用户称呼\n\n{user_name}\n\n# 默认回复语言\n\n{language}\n\n# 对话风格\n\n{conversation_style}\n\n# 持续规则\n\n- 上面的信息优先作为长期规则执行。\n- 如果用户希望修改人设、语气、协作方式或长期规则，应更新 soul，而不是只在当前回复里临时答应。\n"
+    ))
+}
+
+fn parse_soul_answers(content: &str, agent_name: &str) -> SoulAnswers {
+    let defaults = default_soul_answers(agent_name);
+    if content.trim().is_empty() {
+        return defaults;
+    }
+
+    SoulAnswers {
+        user_name: extract_soul_section(content, "用户称呼").unwrap_or(defaults.user_name),
+        assistant_name: extract_soul_section(content, "助手名字")
+            .unwrap_or(defaults.assistant_name),
+        language: extract_soul_section(content, "默认回复语言").unwrap_or(defaults.language),
+        conversation_style: extract_soul_section(content, "对话风格")
+            .unwrap_or(defaults.conversation_style),
+    }
+}
+
+fn extract_soul_section(content: &str, heading: &str) -> Option<String> {
+    let marker = format!("# {heading}");
+    let start = content.find(&marker)? + marker.len();
+    let rest = content[start..].trim_start_matches(['\r', '\n']);
+    let end = rest.find("\n# ").unwrap_or(rest.len());
+    let value = rest[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn section_value(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.into()
+    } else {
+        trimmed.into()
+    }
+}
+
+fn prompt_text(prompt: &str, default: Option<String>, allow_empty: bool) -> Result<String> {
+    let mut input = Input::<String>::new().with_prompt(prompt).allow_empty(allow_empty);
+    if let Some(default) = default.filter(|value| !value.is_empty()) {
+        input = input.default(default);
+    }
+    input.interact_text().map_err(Into::into)
+}
+
+fn normalize_soul_content(content: &str) -> Result<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        bail!("soul 内容不能为空");
+    }
+
+    let mut normalized = trimmed.to_string();
+    normalized.push('\n');
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_soul_answers_reads_existing_sections() {
+        let soul = "# 助手身份\n\n你是 GoldClaw，一个本地 AI 助手。\n\n# 助手名字\n\nGoldClaw\n\n# 用户称呼\n\n阿金\n\n# 默认回复语言\n\n普通话\n\n# 对话风格\n\n直接、简洁，优先给结论。\n";
+        let answers = parse_soul_answers(soul, "GoldClaw");
+
+        assert_eq!(
+            answers,
+            SoulAnswers {
+                user_name: "阿金".into(),
+                assistant_name: "GoldClaw".into(),
+                language: "普通话".into(),
+                conversation_style: "直接、简洁，优先给结论。".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_soul_content_formats_answers_into_sections() {
+        let soul = build_soul_content(
+            "GoldClaw",
+            &SoulAnswers {
+                user_name: "阿金".into(),
+                assistant_name: "GoldClaw".into(),
+                language: "普通话".into(),
+                conversation_style: "回答更直接，并给出下一步。".into(),
+            },
+        )
+        .expect("build soul");
+
+        assert!(soul.contains("# 助手名字\n\nGoldClaw"));
+        assert!(soul.contains("# 用户称呼\n\n阿金"));
+        assert!(soul.contains("# 默认回复语言\n\n普通话"));
+        assert!(soul.contains("# 对话风格\n\n回答更直接，并给出下一步。"));
+    }
 }
 
 fn run_doctor_command(json: bool) -> Result<()> {
@@ -432,9 +567,9 @@ fn build_provider(config: &GoldClawConfig) -> std::sync::Arc<dyn goldclaw_core::
 }
 
 fn build_message_builder(
-    config: &GoldClawConfig,
+    paths: &ProjectPaths,
 ) -> std::sync::Arc<dyn goldclaw_core::MessageBuilder> {
-    std::sync::Arc::new(StandardMessageBuilder::new(config.agent.system_prompt()))
+    std::sync::Arc::new(StandardMessageBuilder::with_soul_path(paths.soul_path()))
 }
 
 fn build_embedding_provider(
@@ -476,10 +611,9 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
 
     let store = SqliteStore::open(StoreLayout::from_project_paths(&paths))?;
     let provider = build_provider(&config);
-    let message_builder = build_message_builder(&config);
+    let message_builder = build_message_builder(&paths);
 
     let soul_path = paths.soul_path();
-    let soul_path = if soul_path.exists() { Some(soul_path) } else { None };
 
     let memory_store: Option<std::sync::Arc<dyn goldclaw_core::MemoryStore>> =
         SqliteMemoryStore::open(&paths.database_file())
@@ -491,7 +625,7 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
 
     tracing::info!(
         bind = %config.gateway.bind,
-        soul_enabled = soul_path.is_some(),
+        soul_enabled = soul_path.exists(),
         embedding_enabled = embedding_provider.is_some(),
         memory_enabled = memory_store.is_some(),
         "starting gateway runtime with memory features"
@@ -500,10 +634,12 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
     let runtime = InMemoryRuntime::with_store_and_memory(
         message_builder,
         provider,
-        std::sync::Arc::new(StaticPolicy::allow_only(["read_file"])),
-        vec![std::sync::Arc::new(ReadWorkspaceTool::new(read_roots))],
+        std::sync::Arc::new(StaticPolicy::allow_only(["read_file", "update_soul"])),
+        vec![
+            std::sync::Arc::new(ReadWorkspaceTool::new(read_roots)),
+            std::sync::Arc::new(UpdateSoulTool::new(soul_path.clone())),
+        ],
         store,
-        soul_path,
         embedding_provider,
         memory_store,
     )

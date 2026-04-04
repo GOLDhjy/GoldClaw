@@ -4,6 +4,7 @@ use goldclaw_memory::SqliteMemoryStore;
 use goldclaw_store::{SqliteStore, StoreLayout};
 use std::{
     env, fs,
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -11,6 +12,43 @@ fn temp_store_layout(unique: u128) -> StoreLayout {
     let database_file = env::temp_dir().join(format!("goldclaw-runtime-{unique}.sqlite3"));
     let backup_dir = env::temp_dir().join(format!("goldclaw-runtime-backups-{unique}"));
     StoreLayout::from_paths(database_file, backup_dir)
+}
+
+struct SoulRefreshProvider {
+    calls: Mutex<usize>,
+}
+
+#[async_trait::async_trait]
+impl Provider for SoulRefreshProvider {
+    fn name(&self) -> &'static str {
+        "soul-refresh"
+    }
+
+    async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
+        let mut calls = self.calls.lock().expect("call lock");
+        *calls += 1;
+
+        if *calls == 1 {
+            return Ok(
+                "<tool_call>\n{\"tool\":\"update_soul\",\"args\":{\"content\":\"# 角色设定\\n\\nINITIAL SOUL\\n\\n# 对话风格\\n\\n- 更冷静。\"}}\n</tool_call>"
+                    .into(),
+            );
+        }
+
+        let system_prompt = messages
+            .iter()
+            .find(|message| message.role == "system")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+
+        if system_prompt.contains("INITIAL SOUL") && system_prompt.contains("- 更冷静。") {
+            Ok("updated soul observed".into())
+        } else {
+            Err(GoldClawError::Internal(format!(
+                "updated soul missing from prompt: {system_prompt}"
+            )))
+        }
+    }
 }
 
 #[tokio::test]
@@ -92,12 +130,19 @@ async fn load_session_returns_history_for_chat_sessions() {
         .expect("create session");
 
     runtime
-        .submit(Envelope::user("hello", EnvelopeSource::Tui, Some(session.id)))
+        .submit(Envelope::user(
+            "hello",
+            EnvelopeSource::Tui,
+            Some(session.id),
+        ))
         .await
         .expect("submit");
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
-    let detail = runtime.load_session(session.id).await.expect("load session");
+    let detail = runtime
+        .load_session(session.id)
+        .await
+        .expect("load session");
     assert_eq!(detail.session.id, session.id);
     assert_eq!(detail.messages.len(), 2);
     assert_eq!(detail.messages[0].role, MessageRole::User);
@@ -164,13 +209,12 @@ async fn sqlite_store_restores_bindings_across_runtime_restart() {
 }
 
 #[tokio::test]
-async fn soul_is_injected_as_system_message_on_session_creation() {
+async fn create_session_does_not_persist_soul_message() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
 
-    // Write a temp soul file.
     let soul_path = env::temp_dir().join(format!("goldclaw-soul-{unique}.md"));
     fs::write(&soul_path, "You are a helpful assistant.").unwrap();
 
@@ -178,12 +222,11 @@ async fn soul_is_injected_as_system_message_on_session_creation() {
     let store = SqliteStore::open(layout.clone()).expect("open store");
 
     let runtime = InMemoryRuntime::with_store_and_memory(
-        Arc::new(StandardMessageBuilder::new(None)),
+        Arc::new(StandardMessageBuilder::with_soul_path(soul_path.clone())),
         Arc::new(EchoProvider),
         Arc::new(StaticPolicy::allow_only::<Vec<String>, String>(vec![])),
         vec![],
         store,
-        Some(soul_path.clone()),
         None,
         None,
     )
@@ -193,9 +236,10 @@ async fn soul_is_injected_as_system_message_on_session_creation() {
     let session = runtime.create_session(None).await.expect("session");
     let detail = runtime.load_session(session.id).await.expect("load");
 
-    assert!(!detail.messages.is_empty(), "should have soul message");
-    assert_eq!(detail.messages[0].role, MessageRole::System);
-    assert_eq!(detail.messages[0].content, "You are a helpful assistant.");
+    assert!(
+        detail.messages.is_empty(),
+        "soul should be read dynamically instead of being persisted into history"
+    );
 
     let _ = fs::remove_file(soul_path);
     let _ = fs::remove_file(layout.paths().database_file.clone());
@@ -223,7 +267,6 @@ async fn memory_is_saved_after_provider_response() {
         vec![],
         store,
         None,
-        None,
         Some(memory_store),
     )
     .await
@@ -231,7 +274,11 @@ async fn memory_is_saved_after_provider_response() {
 
     let session = runtime.create_session(None).await.expect("session");
     runtime
-        .submit(Envelope::user("hello memory", EnvelopeSource::Cli, Some(session.id)))
+        .submit(Envelope::user(
+            "hello memory",
+            EnvelopeSource::Cli,
+            Some(session.id),
+        ))
         .await
         .expect("submit");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -265,12 +312,13 @@ async fn no_soul_message_when_soul_file_missing() {
     let store = SqliteStore::open(layout.clone()).expect("open store");
 
     let runtime = InMemoryRuntime::with_store_and_memory(
-        Arc::new(StandardMessageBuilder::new(None)),
+        Arc::new(StandardMessageBuilder::with_soul_path(PathBuf::from(
+            "/nonexistent/soul.md",
+        ))),
         Arc::new(EchoProvider),
         Arc::new(StaticPolicy::allow_only::<Vec<String>, String>(vec![])),
         vec![],
         store,
-        Some(PathBuf::from("/nonexistent/soul.md")),
         None,
         None,
     )
@@ -286,4 +334,140 @@ async fn no_soul_message_when_soul_file_missing() {
 
     let _ = fs::remove_file(layout.paths().database_file.clone());
     let _ = fs::remove_dir_all(layout.paths().backup_dir.clone());
+}
+
+#[tokio::test]
+async fn standard_message_builder_uses_live_soul_instead_of_legacy_snapshot() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        + 300;
+    let soul_path = env::temp_dir().join(format!("goldclaw-builder-soul-{unique}.md"));
+    fs::write(&soul_path, "# 角色设定\n\nLIVE SOUL").unwrap();
+
+    let builder = StandardMessageBuilder::with_soul_path(soul_path.clone());
+    let session_id = Uuid::new_v4();
+    let messages = builder.build(&[
+        SessionMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: MessageRole::System,
+            source: EnvelopeSource::System,
+            content: "LEGACY SOUL".into(),
+            metadata: json!({ "kind": "soul" }),
+            created_at: Utc::now(),
+        },
+        SessionMessage {
+            id: Uuid::new_v4(),
+            session_id,
+            role: MessageRole::User,
+            source: EnvelopeSource::Cli,
+            content: "hello".into(),
+            metadata: json!({}),
+            created_at: Utc::now(),
+        },
+    ]);
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
+    assert!(messages[0].content.contains("LIVE SOUL"));
+    assert!(!messages[0].content.contains("LEGACY SOUL"));
+    assert_eq!(messages[1].role, "user");
+
+    let _ = fs::remove_file(soul_path);
+}
+
+#[tokio::test]
+async fn provider_can_update_soul_and_see_new_prompt_in_same_turn() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        + 400;
+    let soul_path = env::temp_dir().join(format!("goldclaw-runtime-soul-update-{unique}.md"));
+    fs::write(
+        &soul_path,
+        "# 角色设定\n\nINITIAL SOUL\n\n# 对话风格\n\n- 偏热情。\n",
+    )
+    .unwrap();
+
+    let layout = temp_store_layout(unique);
+    let store = SqliteStore::open(layout.clone()).expect("open store");
+
+    let runtime = InMemoryRuntime::with_store_and_memory(
+        Arc::new(StandardMessageBuilder::with_soul_path(soul_path.clone())),
+        Arc::new(SoulRefreshProvider {
+            calls: Mutex::new(0),
+        }),
+        Arc::new(StaticPolicy::allow_only(["update_soul"])),
+        vec![Arc::new(UpdateSoulTool::new(soul_path.clone()))],
+        store,
+        None,
+        None,
+    )
+    .await
+    .expect("runtime");
+
+    let session = runtime.create_session(None).await.expect("session");
+    runtime
+        .submit(Envelope::user(
+            "以后说话更冷静一些",
+            EnvelopeSource::Cli,
+            Some(session.id),
+        ))
+        .await
+        .expect("submit");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let soul = fs::read_to_string(&soul_path).expect("read soul");
+    assert!(soul.contains("INITIAL SOUL"));
+    assert!(soul.contains("- 更冷静。"));
+    assert!(!soul.contains("- 偏热情。"));
+
+    let detail = runtime.load_session(session.id).await.expect("load");
+    assert_eq!(detail.messages.len(), 3);
+    assert_eq!(detail.messages[1].role, MessageRole::Tool);
+    assert_eq!(
+        detail.messages[1]
+            .metadata
+            .get("tool_name")
+            .and_then(|value| value.as_str()),
+        Some("update_soul")
+    );
+    assert_eq!(detail.messages[2].role, MessageRole::Assistant);
+    assert_eq!(detail.messages[2].content, "updated soul observed");
+
+    let _ = fs::remove_file(soul_path);
+    let _ = fs::remove_file(layout.paths().database_file.clone());
+    let _ = fs::remove_dir_all(layout.paths().backup_dir.clone());
+}
+
+#[tokio::test]
+async fn update_soul_tool_writes_and_returns_full_content() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        + 500;
+    let soul_path = env::temp_dir().join(format!("goldclaw-update-soul-full-{unique}.md"));
+    let original = "# 助手身份\n\n你是 GoldClaw。\n\n# 用户称呼\n\n老板\n";
+    fs::write(&soul_path, original).expect("write soul");
+
+    let tool = UpdateSoulTool::new(soul_path.clone());
+    let new_content = "# 助手身份\n\n你是 GoldClaw。\n\n# 用户称呼\n\n老板\n\n# 对话风格\n\n稳重点。\n";
+    let invocation = ToolInvocation {
+        session_id: Uuid::new_v4(),
+        tool_name: "update_soul".into(),
+        source: EnvelopeSource::System,
+        args: json!({ "content": new_content }),
+    };
+
+    let output = tool.execute(&invocation).await.expect("update soul");
+
+    let updated = fs::read_to_string(&soul_path).expect("read updated soul");
+    assert_eq!(updated, output.content);
+    assert!(updated.contains("# 对话风格\n\n稳重点。"));
+
+    let _ = fs::remove_file(soul_path);
 }

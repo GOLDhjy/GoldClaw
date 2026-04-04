@@ -78,10 +78,10 @@ pub struct AgentSettings {
     #[serde(default = "default_agent_name")]
     pub name: String,
     /// Personality description shown to the LLM as part of the system prompt.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub personality: String,
     /// Speaking style instructions shown to the LLM as part of the system prompt.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub style: String,
 }
 

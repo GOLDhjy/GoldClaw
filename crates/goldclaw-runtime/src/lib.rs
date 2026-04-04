@@ -8,14 +8,14 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use goldclaw_core::{
-    AssistantEvent, ChatMessage, Envelope, EnvelopeSource, EmbeddingProvider, GoldClawError,
+    AssistantEvent, ChatMessage, EmbeddingProvider, Envelope, EnvelopeSource, GoldClawError,
     MemoryChunk, MemoryQuery, MemoryStore, MessageBuilder, MessageRole, Policy, PolicyDecision,
     Provider, Result, RuntimeHandle, RuntimeHealth, SessionBinding, SessionDetail, SessionMessage,
     SessionSummary, SubmissionReceipt, Tool, ToolInvocation, ToolOutput,
 };
 use goldclaw_store::{SqliteStore, StoreError};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{RwLock, broadcast};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -34,7 +34,6 @@ struct RuntimeInner {
     provider: Arc<dyn Provider>,
     policy: Arc<dyn Policy>,
     tools: HashMap<String, Arc<dyn Tool>>,
-    soul_path: Option<PathBuf>,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     memory_store: Option<Arc<dyn MemoryStore>>,
 }
@@ -51,7 +50,7 @@ impl InMemoryRuntime {
         policy: Arc<dyn Policy>,
         tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
-        Self::build(message_builder, provider, policy, tools, None, None, None, None)
+        Self::build(message_builder, provider, policy, tools, None, None, None)
     }
 
     pub async fn with_store(
@@ -61,7 +60,8 @@ impl InMemoryRuntime {
         tools: Vec<Arc<dyn Tool>>,
         store: SqliteStore,
     ) -> Result<Self> {
-        Self::with_store_and_memory(message_builder, provider, policy, tools, store, None, None, None).await
+        Self::with_store_and_memory(message_builder, provider, policy, tools, store, None, None)
+            .await
     }
 
     pub async fn with_store_and_memory(
@@ -70,7 +70,6 @@ impl InMemoryRuntime {
         policy: Arc<dyn Policy>,
         tools: Vec<Arc<dyn Tool>>,
         store: SqliteStore,
-        soul_path: Option<PathBuf>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
         memory_store: Option<Arc<dyn MemoryStore>>,
     ) -> Result<Self> {
@@ -80,7 +79,6 @@ impl InMemoryRuntime {
             policy,
             tools,
             Some(store.clone()),
-            soul_path,
             embedding_provider,
             memory_store,
         );
@@ -94,7 +92,6 @@ impl InMemoryRuntime {
         policy: Arc<dyn Policy>,
         tools: Vec<Arc<dyn Tool>>,
         store: Option<SqliteStore>,
-        soul_path: Option<PathBuf>,
         embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
         memory_store: Option<Arc<dyn MemoryStore>>,
     ) -> Self {
@@ -113,7 +110,6 @@ impl InMemoryRuntime {
                 provider,
                 policy,
                 tools,
-                soul_path,
                 embedding_provider,
                 memory_store,
             }),
@@ -188,28 +184,6 @@ impl InMemoryRuntime {
         Ok(())
     }
 
-    fn load_soul_message(
-        &self,
-        session_id: Uuid,
-        now: chrono::DateTime<Utc>,
-    ) -> Option<SessionMessage> {
-        let soul_path = self.inner.soul_path.as_ref()?;
-        let content = fs::read_to_string(soul_path).ok()?;
-        let content = content.trim().to_string();
-        if content.is_empty() {
-            return None;
-        }
-        Some(SessionMessage {
-            id: Uuid::new_v4(),
-            session_id,
-            role: MessageRole::System,
-            source: EnvelopeSource::System,
-            content,
-            metadata: json!({ "kind": "soul" }),
-            created_at: now,
-        })
-    }
-
     async fn recall_memory(&self, user_text: &str) -> Option<String> {
         let memory_store = self.inner.memory_store.as_ref()?;
 
@@ -248,7 +222,10 @@ impl InMemoryRuntime {
         };
 
         if chunks.is_empty() {
-            info!(query_chars = user_text.chars().count(), "memory recall returned no hits");
+            info!(
+                query_chars = user_text.chars().count(),
+                "memory recall returned no hits"
+            );
             return None;
         }
         info!(
@@ -427,74 +404,83 @@ impl InMemoryRuntime {
     }
 
     async fn run_provider(&self, session_id: Uuid, envelope: &Envelope) -> Result<()> {
-        let history = {
-            let sessions = self.inner.sessions.read().await;
-            sessions
-                .get(&session_id)
-                .map(|s| s.history.clone())
-                .unwrap_or_default()
-        };
+        let memory_block = self.recall_memory(&envelope.content).await;
 
-        let mut messages = self.inner.message_builder.build(&history);
+        for _ in 0..4 {
+            let history = {
+                let sessions = self.inner.sessions.read().await;
+                sessions
+                    .get(&session_id)
+                    .map(|s| s.history.clone())
+                    .unwrap_or_default()
+            };
 
-        // Inject relevant memories into the last user message.
-        if let Some(memory_block) = self.recall_memory(&envelope.content).await {
-            if let Some(last_user) = messages.iter_mut().rfind(|m| m.role == "user") {
-                last_user.content = format!("{memory_block}\n\n[User Input]\n{}", last_user.content);
+            let mut messages = self.inner.message_builder.build(&history);
+
+            // Inject relevant memories into the last user message.
+            if let Some(memory_block) = memory_block.as_deref() {
+                if let Some(last_user) = messages.iter_mut().rfind(|m| m.role == "user") {
+                    last_user.content =
+                        format!("{memory_block}\n\n[User Input]\n{}", last_user.content);
+                }
             }
+
+            let content = self.inner.provider.chat(&messages).await?;
+            if let Some(tool_call) = parse_assistant_tool_call(&content)? {
+                self.execute_tool(ToolInvocation {
+                    session_id,
+                    tool_name: tool_call.tool,
+                    source: EnvelopeSource::System,
+                    args: tool_call.args,
+                })
+                .await?;
+                continue;
+            }
+
+            let completed_at = Utc::now();
+            self.emit(
+                session_id,
+                AssistantEvent::MessageChunk {
+                    session_id,
+                    content: content.clone(),
+                    at: completed_at,
+                },
+            )
+            .await;
+            self.emit(
+                session_id,
+                AssistantEvent::MessageCompleted {
+                    session_id,
+                    content: content.clone(),
+                    at: completed_at,
+                },
+            )
+            .await;
+
+            self.append_message(SessionMessage {
+                id: Uuid::new_v4(),
+                session_id,
+                role: MessageRole::Assistant,
+                source: envelope.source.clone(),
+                content: content.clone(),
+                metadata: json!({ "kind": "provider_response" }),
+                created_at: completed_at,
+            })
+            .await?;
+
+            // Save memory chunk after response (best effort).
+            self.save_memory_chunk(session_id, &envelope.content, &content)
+                .await;
+
+            return Ok(());
         }
 
-        let content = self.inner.provider.chat(&messages).await?;
-        let completed_at = Utc::now();
-        self.emit(
-            session_id,
-            AssistantEvent::MessageChunk {
-                session_id,
-                content: content.clone(),
-                at: completed_at,
-            },
-        )
-        .await;
-        self.emit(
-            session_id,
-            AssistantEvent::MessageCompleted {
-                session_id,
-                content: content.clone(),
-                at: completed_at,
-            },
-        )
-        .await;
-
-        self.append_message(SessionMessage {
-            id: Uuid::new_v4(),
-            session_id,
-            role: MessageRole::Assistant,
-            source: envelope.source.clone(),
-            content: content.clone(),
-            metadata: json!({ "kind": "provider_response" }),
-            created_at: completed_at,
-        })
-        .await?;
-
-        // Save memory chunk after response (best effort).
-        self.save_memory_chunk(session_id, &envelope.content, &content).await;
-
-        Ok(())
+        Err(GoldClawError::Internal(
+            "assistant exceeded tool call limit".into(),
+        ))
     }
 
-    async fn run_read_tool(
-        &self,
-        session_id: Uuid,
-        source: &EnvelopeSource,
-        path: String,
-    ) -> Result<()> {
-        let invocation = ToolInvocation {
-            session_id,
-            tool_name: "read_file".into(),
-            source: source.clone(),
-            args: json!({ "path": path }),
-        };
-
+    async fn execute_tool(&self, invocation: ToolInvocation) -> Result<ToolOutput> {
         match self.inner.policy.authorize(&invocation).await? {
             PolicyDecision::Allow => {}
             PolicyDecision::Deny { reason } => {
@@ -505,14 +491,16 @@ impl InMemoryRuntime {
         let tool = self
             .inner
             .tools
-            .get("read_file")
+            .get(&invocation.tool_name)
             .cloned()
-            .ok_or_else(|| GoldClawError::Internal("read_file tool missing".into()))?;
+            .ok_or_else(|| {
+                GoldClawError::Internal(format!("tool `{}` missing", invocation.tool_name))
+            })?;
 
         self.emit(
-            session_id,
+            invocation.session_id,
             AssistantEvent::ToolStarted {
-                session_id,
+                session_id: invocation.session_id,
                 tool_name: tool.name().into(),
                 at: Utc::now(),
             },
@@ -522,20 +510,11 @@ impl InMemoryRuntime {
         let output = tool.execute(&invocation).await?;
         let completed_at = Utc::now();
         self.emit(
-            session_id,
+            invocation.session_id,
             AssistantEvent::ToolCompleted {
-                session_id,
+                session_id: invocation.session_id,
                 tool_name: tool.name().into(),
                 output: output.clone(),
-                at: completed_at,
-            },
-        )
-        .await;
-        self.emit(
-            session_id,
-            AssistantEvent::MessageCompleted {
-                session_id,
-                content: output.content.clone(),
                 at: completed_at,
             },
         )
@@ -543,10 +522,10 @@ impl InMemoryRuntime {
 
         self.append_message(SessionMessage {
             id: Uuid::new_v4(),
-            session_id,
+            session_id: invocation.session_id,
             role: MessageRole::Tool,
             source: EnvelopeSource::System,
-            content: output.content,
+            content: output.content.clone(),
             metadata: json!({
                 "kind": "tool_output",
                 "tool_name": tool.name(),
@@ -555,6 +534,33 @@ impl InMemoryRuntime {
             created_at: completed_at,
         })
         .await?;
+        Ok(output)
+    }
+
+    async fn run_read_tool(
+        &self,
+        session_id: Uuid,
+        source: &EnvelopeSource,
+        path: String,
+    ) -> Result<()> {
+        let output = self
+            .execute_tool(ToolInvocation {
+                session_id,
+                tool_name: "read_file".into(),
+                source: source.clone(),
+                args: json!({ "path": path }),
+            })
+            .await?;
+
+        self.emit(
+            session_id,
+            AssistantEvent::MessageCompleted {
+                session_id,
+                content: output.content,
+                at: Utc::now(),
+            },
+        )
+        .await;
         Ok(())
     }
 }
@@ -570,27 +576,18 @@ impl RuntimeHandle for InMemoryRuntime {
             updated_at: now,
         };
 
-        let soul_message = self.load_soul_message(session.id, now);
-
         {
             let mut sessions = self.inner.sessions.write().await;
-            let mut history = Vec::new();
-            if let Some(ref msg) = soul_message {
-                history.push(msg.clone());
-            }
             sessions.insert(
                 session.id,
                 SessionState {
                     summary: session.clone(),
-                    history,
+                    history: Vec::new(),
                 },
             );
         }
 
         self.persist_session(&session)?;
-        if let Some(msg) = soul_message {
-            self.persist_message(&msg)?;
-        }
 
         self.emit(
             session.id,
@@ -705,13 +702,79 @@ fn auto_title_for_conversation(conversation: &goldclaw_core::ConversationRef) ->
     }
 }
 
+const ASSISTANT_TOOL_CALL_OPEN: &str = "<tool_call>";
+const ASSISTANT_TOOL_CALL_CLOSE: &str = "</tool_call>";
+const LOCAL_ASSISTANT_RUNTIME_PROMPT: &str = r#"你运行在 GoldClaw 中。
+
+下面的 [Active Soul] 是当前生效的人设文件，每次模型调用都会重新读取。
+如果用户要求修改你的人设、自我介绍、长期行为规则、回答风格、语气、格式习惯，或者其他持续生效的对话规则，你必须调用 `update_soul`，不能只在回复里口头答应。
+你已经能看到完整的当前 soul 文件内容，不需要先再读取一次才能修改。
+
+工具调用格式：你必须只输出下面这个 XML 块，不能输出其它文本：
+<tool_call>
+{"tool":"tool_name","args":{...}}
+</tool_call>
+
+工具执行后，你会基于最新上下文再次被调用，然后再正常回复用户。
+
+可用工具：
+- update_soul: {"content":"完整的新 soul.md 内容"}。你必须基于当前 [Active Soul] 生成修改后的完整全文，不要只传片段、补丁或说明文字。工具会把写入后的全文返回给你。
+- read_file: {"path":"相对或绝对路径"}。它会读取允许范围内的 UTF-8 文本文件。"#;
+
+#[derive(Deserialize)]
+struct AssistantToolCall {
+    tool: String,
+    #[serde(default = "default_tool_args")]
+    args: Value,
+}
+
+fn default_tool_args() -> Value {
+    json!({})
+}
+
 pub struct StandardMessageBuilder {
     system_prompt: Option<String>,
+    soul_path: Option<PathBuf>,
 }
 
 impl StandardMessageBuilder {
     pub fn new(system_prompt: Option<String>) -> Self {
-        Self { system_prompt }
+        Self {
+            system_prompt,
+            soul_path: None,
+        }
+    }
+
+    pub fn with_soul_path(soul_path: PathBuf) -> Self {
+        Self {
+            system_prompt: Some(LOCAL_ASSISTANT_RUNTIME_PROMPT.into()),
+            soul_path: Some(soul_path),
+        }
+    }
+
+    fn load_system_prompt(&self) -> Option<String> {
+        let mut sections = Vec::new();
+        if let Some(prompt) = &self.system_prompt {
+            let prompt = prompt.trim();
+            if !prompt.is_empty() {
+                sections.push(prompt.to_string());
+            }
+        }
+
+        if let Some(soul_path) = &self.soul_path {
+            if let Ok(content) = fs::read_to_string(soul_path) {
+                let content = content.trim();
+                if !content.is_empty() {
+                    sections.push(format!("[Active Soul]\n{content}"));
+                }
+            }
+        }
+
+        if sections.is_empty() {
+            None
+        } else {
+            Some(sections.join("\n\n"))
+        }
     }
 }
 
@@ -719,26 +782,32 @@ impl MessageBuilder for StandardMessageBuilder {
     fn build(&self, history: &[SessionMessage]) -> Vec<ChatMessage> {
         let mut messages: Vec<ChatMessage> = Vec::new();
 
-        if let Some(prompt) = &self.system_prompt {
-            let has_system = history.iter().any(|m| m.role == MessageRole::System);
-            if !has_system {
-                messages.push(ChatMessage {
-                    role: "system".into(),
-                    content: prompt.clone(),
-                });
-            }
+        if let Some(prompt) = self.load_system_prompt() {
+            messages.push(ChatMessage {
+                role: "system".into(),
+                content: prompt,
+            });
         }
 
         for msg in history {
-            let role = match msg.role {
-                MessageRole::System => "system",
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-                MessageRole::Tool => "tool",
-            };
-            messages.push(ChatMessage {
-                role: role.into(),
-                content: msg.content.clone(),
+            if is_legacy_soul_message(msg) {
+                continue;
+            }
+
+            messages.push(match msg.role {
+                MessageRole::System => ChatMessage {
+                    role: "system".into(),
+                    content: msg.content.clone(),
+                },
+                MessageRole::User => ChatMessage {
+                    role: "user".into(),
+                    content: msg.content.clone(),
+                },
+                MessageRole::Assistant => ChatMessage {
+                    role: "assistant".into(),
+                    content: msg.content.clone(),
+                },
+                MessageRole::Tool => format_tool_message(msg),
             });
         }
 
@@ -867,9 +936,24 @@ impl ReadWorkspaceTool {
     }
 }
 
+pub struct UpdateSoulTool {
+    soul_path: PathBuf,
+}
+
+impl UpdateSoulTool {
+    pub fn new(soul_path: PathBuf) -> Self {
+        Self { soul_path }
+    }
+}
+
 #[derive(Deserialize)]
 struct ReadArgs {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateSoulArgs {
+    content: String,
 }
 
 #[async_trait]
@@ -889,6 +973,33 @@ impl Tool for ReadWorkspaceTool {
     }
 }
 
+#[async_trait]
+impl Tool for UpdateSoulTool {
+    fn name(&self) -> &'static str {
+        "update_soul"
+    }
+
+    async fn execute(&self, invocation: &ToolInvocation) -> Result<ToolOutput> {
+        let args: UpdateSoulArgs = serde_json::from_value(invocation.args.clone())?;
+        let content = normalize_soul_content(&args.content)?;
+
+        if let Some(parent) = self.soul_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&self.soul_path, content.as_bytes()).map_err(|error| {
+            GoldClawError::Io(format!(
+                "failed to write `{}`: {error}",
+                self.soul_path.display()
+            ))
+        })?;
+
+        Ok(ToolOutput {
+            summary: format!("updated {}", self.soul_path.display()),
+            content,
+        })
+    }
+}
+
 fn parse_read_command(content: &str) -> Option<String> {
     let trimmed = content.trim();
     trimmed
@@ -897,6 +1008,82 @@ fn parse_read_command(content: &str) -> Option<String> {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn parse_assistant_tool_call(content: &str) -> Result<Option<AssistantToolCall>> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with(ASSISTANT_TOOL_CALL_OPEN) {
+        return Ok(None);
+    }
+    if !trimmed.ends_with(ASSISTANT_TOOL_CALL_CLOSE) {
+        return Err(GoldClawError::Internal(
+            "assistant emitted malformed tool call wrapper".into(),
+        ));
+    }
+
+    let payload =
+        &trimmed[ASSISTANT_TOOL_CALL_OPEN.len()..trimmed.len() - ASSISTANT_TOOL_CALL_CLOSE.len()];
+    let call: AssistantToolCall = serde_json::from_str(payload.trim()).map_err(|error| {
+        GoldClawError::Internal(format!(
+            "assistant emitted malformed tool call JSON: {error}"
+        ))
+    })?;
+
+    if call.tool.trim().is_empty() {
+        return Err(GoldClawError::Internal(
+            "assistant emitted tool call without a tool name".into(),
+        ));
+    }
+
+    Ok(Some(call))
+}
+
+fn is_legacy_soul_message(message: &SessionMessage) -> bool {
+    message.role == MessageRole::System
+        && message
+            .metadata
+            .get("kind")
+            .and_then(|value| value.as_str())
+            == Some("soul")
+}
+
+fn format_tool_message(message: &SessionMessage) -> ChatMessage {
+    let tool_name = message
+        .metadata
+        .get("tool_name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("tool");
+    let summary = message
+        .metadata
+        .get("summary")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    let mut content = format!("[Tool `{tool_name}` Result]");
+    if !summary.is_empty() {
+        content.push_str(&format!("\nSummary: {summary}"));
+    }
+    if !message.content.is_empty() {
+        content.push_str(&format!("\n{}", message.content));
+    }
+
+    ChatMessage {
+        role: "system".into(),
+        content,
+    }
+}
+
+fn normalize_soul_content(content: &str) -> Result<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err(GoldClawError::InvalidInput(
+            "soul content cannot be empty".into(),
+        ));
+    }
+
+    let mut normalized = trimmed.to_string();
+    normalized.push('\n');
+    Ok(normalized)
 }
 
 #[cfg(test)]
