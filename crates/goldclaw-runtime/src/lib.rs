@@ -8,9 +8,10 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use goldclaw_core::{
-    AssistantEvent, Envelope, EnvelopeSource, GoldClawError, MessageRole, Policy, PolicyDecision,
-    Provider, Result, RuntimeHandle, RuntimeHealth, SessionBinding, SessionMessage, SessionSummary,
-    SubmissionReceipt, Tool, ToolInvocation, ToolOutput,
+    AssistantEvent, ChatMessage, Envelope, EnvelopeSource, GoldClawError, MessageBuilder,
+    MessageRole, Policy, PolicyDecision, Provider, Result, RuntimeHandle, RuntimeHealth,
+    SessionBinding, SessionDetail, SessionMessage, SessionSummary, SubmissionReceipt, Tool,
+    ToolInvocation, ToolOutput,
 };
 use goldclaw_store::{SqliteStore, StoreError};
 use serde::Deserialize;
@@ -28,6 +29,7 @@ struct RuntimeInner {
     bindings: RwLock<HashMap<String, SessionBinding>>,
     channels: RwLock<HashMap<Uuid, broadcast::Sender<AssistantEvent>>>,
     store: Option<SqliteStore>,
+    message_builder: Arc<dyn MessageBuilder>,
     provider: Arc<dyn Provider>,
     policy: Arc<dyn Policy>,
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -40,25 +42,34 @@ struct SessionState {
 
 impl InMemoryRuntime {
     pub fn new(
+        message_builder: Arc<dyn MessageBuilder>,
         provider: Arc<dyn Provider>,
         policy: Arc<dyn Policy>,
         tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
-        Self::build(provider, policy, tools, None)
+        Self::build(message_builder, provider, policy, tools, None)
     }
 
     pub async fn with_store(
+        message_builder: Arc<dyn MessageBuilder>,
         provider: Arc<dyn Provider>,
         policy: Arc<dyn Policy>,
         tools: Vec<Arc<dyn Tool>>,
         store: SqliteStore,
     ) -> Result<Self> {
-        let runtime = Self::build(provider, policy, tools, Some(store.clone()));
+        let runtime = Self::build(
+            message_builder,
+            provider,
+            policy,
+            tools,
+            Some(store.clone()),
+        );
         runtime.restore_from_store(&store).await?;
         Ok(runtime)
     }
 
     fn build(
+        message_builder: Arc<dyn MessageBuilder>,
         provider: Arc<dyn Provider>,
         policy: Arc<dyn Policy>,
         tools: Vec<Arc<dyn Tool>>,
@@ -75,6 +86,7 @@ impl InMemoryRuntime {
                 bindings: RwLock::new(HashMap::new()),
                 channels: RwLock::new(HashMap::new()),
                 store,
+                message_builder,
                 provider,
                 policy,
                 tools,
@@ -279,7 +291,8 @@ impl InMemoryRuntime {
                 .map(|s| s.history.clone())
                 .unwrap_or_default()
         };
-        let content = self.inner.provider.generate(envelope, &history).await?;
+        let messages = self.inner.message_builder.build(&history);
+        let content = self.inner.provider.chat(&messages).await?;
         let completed_at = Utc::now();
         self.emit(
             session_id,
@@ -436,6 +449,17 @@ impl RuntimeHandle for InMemoryRuntime {
         Ok(list)
     }
 
+    async fn load_session(&self, session_id: Uuid) -> Result<SessionDetail> {
+        let sessions = self.inner.sessions.read().await;
+        let state = sessions
+            .get(&session_id)
+            .ok_or_else(|| GoldClawError::NotFound(format!("session `{session_id}`")))?;
+        Ok(SessionDetail {
+            session: state.summary.clone(),
+            messages: state.history.clone(),
+        })
+    }
+
     async fn submit(&self, mut envelope: Envelope) -> Result<SubmissionReceipt> {
         let session = self.resolve_session(&envelope).await?;
         let session_id = session.id;
@@ -516,6 +540,47 @@ fn auto_title_for_conversation(conversation: &goldclaw_core::ConversationRef) ->
     }
 }
 
+pub struct StandardMessageBuilder {
+    system_prompt: Option<String>,
+}
+
+impl StandardMessageBuilder {
+    pub fn new(system_prompt: Option<String>) -> Self {
+        Self { system_prompt }
+    }
+}
+
+impl MessageBuilder for StandardMessageBuilder {
+    fn build(&self, history: &[SessionMessage]) -> Vec<ChatMessage> {
+        let mut messages: Vec<ChatMessage> = Vec::new();
+
+        if let Some(prompt) = &self.system_prompt {
+            let has_system = history.iter().any(|m| m.role == MessageRole::System);
+            if !has_system {
+                messages.push(ChatMessage {
+                    role: "system".into(),
+                    content: prompt.clone(),
+                });
+            }
+        }
+
+        for msg in history {
+            let role = match msg.role {
+                MessageRole::System => "system",
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::Tool => "tool",
+            };
+            messages.push(ChatMessage {
+                role: role.into(),
+                content: msg.content.clone(),
+            });
+        }
+
+        messages
+    }
+}
+
 pub struct EchoProvider;
 
 #[async_trait]
@@ -524,8 +589,14 @@ impl Provider for EchoProvider {
         "echo"
     }
 
-    async fn generate(&self, envelope: &Envelope, _history: &[SessionMessage]) -> Result<String> {
-        Ok(format!("echo: {}", envelope.content.trim()))
+    async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
+        let content = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        Ok(format!("echo: {}", content.trim()))
     }
 }
 

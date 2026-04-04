@@ -4,7 +4,7 @@ use anyhow::Result as AnyhowResult;
 use axum::{
     Router,
     extract::{Json, Path, Request, State},
-    http::{HeaderMap, StatusCode, header::ORIGIN},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -15,7 +15,7 @@ use axum::{
 use futures_util::{StreamExt, stream::Stream};
 use goldclaw_core::{
     AssistantEvent, ConversationRef, Envelope, EnvelopeSource, GoldClawError, RuntimeHandle,
-    SessionSummary,
+    SessionDetail, SessionSummary,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -58,8 +58,9 @@ impl GatewayServer {
         let router = Router::new()
             .route("/healthz", get(healthz))
             .route("/status", get(status))
-            .route("/sessions", get(list_sessions).post(create_session))
-            .route("/messages", post(submit_message))
+            .route("/sessions", get(list_sessions).post(create_session).options(preflight))
+            .route("/sessions/{session_id}", get(load_session))
+            .route("/messages", post(submit_message).options(preflight))
             .route("/sessions/{session_id}/events", get(session_events))
             .with_state(state.clone())
             .layer(middleware::from_fn_with_state(state, enforce_origin));
@@ -71,6 +72,10 @@ impl GatewayServer {
             .await?;
         Ok(())
     }
+}
+
+async fn preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn healthz(
@@ -92,6 +97,13 @@ async fn list_sessions(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<Vec<SessionSummary>>, ApiError> {
     Ok(Json(state.runtime.list_sessions().await?))
+}
+
+async fn load_session(
+    Path(session_id): Path<Uuid>,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<SessionDetail>, ApiError> {
+    Ok(Json(state.runtime.load_session(session_id).await?))
 }
 
 async fn create_session(
@@ -137,20 +149,69 @@ async fn enforce_origin(
     request: Request,
     next: Next,
 ) -> Response {
-    if let Some(origin) = headers.get(ORIGIN).and_then(|header| header.to_str().ok()) {
-        if !origin_allowed(origin, &state.allowed_origins) {
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    // Preflight — respond immediately.
+    if request.method() == Method::OPTIONS {
+        if let Some(ref o) = origin {
+            if origin_allowed(o, &state.allowed_origins) {
+                return cors_preflight_response(o);
+            }
+        }
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    if let Some(ref o) = origin {
+        if !origin_allowed(o, &state.allowed_origins) {
             return (
                 StatusCode::FORBIDDEN,
                 Json(ApiProblem {
                     error: "origin_not_allowed".into(),
-                    message: format!("origin `{origin}` is not allowed"),
+                    message: format!("origin `{o}` is not allowed"),
                 }),
             )
                 .into_response();
         }
     }
 
-    next.run(request).await
+    let mut response = next.run(request).await;
+
+    if let Some(o) = origin {
+        let hdrs = response.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&o) {
+            hdrs.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        }
+        hdrs.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            HeaderValue::from_static("true"),
+        );
+    }
+
+    response
+}
+
+fn cors_preflight_response(origin: &str) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    let hdrs = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(origin) {
+        hdrs.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+    }
+    hdrs.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    hdrs.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type"),
+    );
+    hdrs.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        HeaderValue::from_static("true"),
+    );
+    response
 }
 
 fn origin_allowed(origin: &str, allowed_origins: &[String]) -> bool {
@@ -158,6 +219,14 @@ fn origin_allowed(origin: &str, allowed_origins: &[String]) -> bool {
         Ok(value) => value,
         Err(_) => return false,
     };
+
+    // Allow any http/https request from localhost or 127.0.0.1, regardless of port.
+    if matches!(parsed.scheme(), "http" | "https") {
+        if matches!(parsed.host_str(), Some("localhost") | Some("127.0.0.1")) {
+            return true;
+        }
+    }
+
     let base = format!(
         "{}://{}",
         parsed.scheme(),

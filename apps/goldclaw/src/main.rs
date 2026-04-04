@@ -11,13 +11,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use dialoguer::Input;
-use goldclaw_config::{AgentSettings, GatewaySettings, GoldClawConfig, ProjectPaths, ProviderSettings, RuntimeSettings};
+use goldclaw_config::{
+    AgentSettings, GatewaySettings, GoldClawConfig, ProjectPaths, ProviderSettings, RuntimeSettings,
+};
 use goldclaw_doctor::{DoctorReport, HealthStatus, run_doctor};
 use goldclaw_gateway::{GatewayConfig, GatewayServer};
-use goldclaw_connector_stdin::StdinConnector;
-use goldclaw_core::Connector;
 use goldclaw_provider_glm::GlmProvider;
-use goldclaw_runtime::{EchoProvider, InMemoryRuntime, ReadWorkspaceTool, StaticPolicy};
+use goldclaw_runtime::{
+    EchoProvider, InMemoryRuntime, ReadWorkspaceTool, StandardMessageBuilder, StaticPolicy,
+};
 use goldclaw_store::{SqliteStore, StoreLayout, current_schema_version};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
@@ -36,9 +38,9 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    Chat,
     Start,
     Stop,
+    Restart,
     Status,
     Gateway {
         #[command(subcommand)]
@@ -70,9 +72,12 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init => init_config(false)?,
         Commands::Doctor { json } => run_doctor_command(json)?,
-        Commands::Chat => chat_run().await?,
         Commands::Start => start_gateway()?,
         Commands::Stop => stop_gateway()?,
+        Commands::Restart => {
+            stop_gateway()?;
+            start_gateway()?;
+        }
         Commands::Status => show_status()?,
         Commands::Gateway { command } => match command {
             GatewayCommand::Run { bind } => gateway_run(bind).await?,
@@ -167,7 +172,11 @@ fn init_config(_force: bool) -> Result<()> {
             read_roots: vec![PathBuf::from(read_root)],
         },
         provider: ProviderSettings {
-            api_key: if api_key.is_empty() { None } else { Some(api_key) },
+            api_key: if api_key.is_empty() {
+                None
+            } else {
+                Some(api_key)
+            },
             model: existing.provider.model,
         },
     };
@@ -188,7 +197,15 @@ fn init_config(_force: bool) -> Result<()> {
         sqlite.applied_schema_version()?,
         current_schema_version()
     );
-    println!("下一步可以运行 `goldclaw start` 启动后台服务。");
+
+    println!("\n正在启动后台服务...");
+    match start_gateway() {
+        Ok(()) => {} // start_gateway already printed the web URL
+        Err(e) => {
+            println!("警告: 后台服务启动失败: {e}");
+            println!("可以稍后手动运行 `goldclaw start`");
+        }
+    }
     Ok(())
 }
 
@@ -244,7 +261,7 @@ fn start_gateway() -> Result<()> {
     let err_file = log_file.try_clone()?;
 
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let mut command = Command::new(exe);
+    let mut command = Command::new(&exe);
     command.arg("gateway").arg("run");
     command.stdin(Stdio::null());
     command.stdout(Stdio::from(log_file));
@@ -264,21 +281,55 @@ fn start_gateway() -> Result<()> {
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(150));
         if port_open(&config.gateway.bind) {
-            println!(
-                "GoldClaw gateway 已启动: {} (pid {})",
-                config.gateway.bind,
-                child.id()
-            );
-            return Ok(());
+            println!("GoldClaw gateway 已启动 (pid {})", child.id());
+            break;
         }
     }
 
-    bail!(
-        "gateway process spawned (pid {}), but port {} did not become reachable; inspect {}",
-        child.id(),
-        config.gateway.bind,
-        log_path.display()
-    );
+    if !port_open(&config.gateway.bind) {
+        bail!(
+            "gateway process spawned (pid {}), but port {} did not become reachable; inspect {}",
+            child.id(),
+            config.gateway.bind,
+            log_path.display()
+        );
+    }
+
+    // Start the web UI server.
+    let web_bind =
+        std::env::var("GOLDCLAW_WEB_BIND").unwrap_or_else(|_| "127.0.0.1:4264".to_string());
+    let web_exe = exe.with_file_name("goldclaw-web");
+    if web_exe.exists() {
+        let web_log = log_path.with_file_name("web.log");
+        let web_log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&web_log)
+            .with_context(|| format!("failed to open {}", web_log.display()))?;
+        let web_err_file = web_log_file.try_clone()?;
+
+        let mut web_cmd = Command::new(&web_exe);
+        web_cmd.env("GOLDCLAW_WEB_BIND", &web_bind);
+        web_cmd.stdin(Stdio::null());
+        web_cmd.stdout(Stdio::from(web_log_file));
+        web_cmd.stderr(Stdio::from(web_err_file));
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            web_cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        }
+
+        let web_child = web_cmd.spawn().context("failed to spawn web process")?;
+        println!("GoldClaw web    已启动 (pid {})", web_child.id());
+        println!("\n打开浏览器开始对话: http://{web_bind}");
+    } else {
+        println!("\n打开浏览器开始对话: http://{web_bind}  (需先安装 goldclaw-web)");
+    }
+
+    Ok(())
 }
 
 fn stop_gateway() -> Result<()> {
@@ -351,7 +402,6 @@ fn build_provider(config: &GoldClawConfig) -> std::sync::Arc<dyn goldclaw_core::
     match GlmProvider::from_env_or_config(
         config.provider.api_key.clone(),
         config.provider.model.clone(),
-        config.agent.system_prompt(),
     ) {
         Ok(p) => {
             tracing::info!("using GLM provider");
@@ -362,6 +412,12 @@ fn build_provider(config: &GoldClawConfig) -> std::sync::Arc<dyn goldclaw_core::
             std::sync::Arc::new(EchoProvider)
         }
     }
+}
+
+fn build_message_builder(
+    config: &GoldClawConfig,
+) -> std::sync::Arc<dyn goldclaw_core::MessageBuilder> {
+    std::sync::Arc::new(StandardMessageBuilder::new(config.agent.system_prompt()))
 }
 
 async fn gateway_run(bind_override: Option<String>) -> Result<()> {
@@ -391,7 +447,9 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
 
     let store = SqliteStore::open(StoreLayout::from_project_paths(&paths))?;
     let provider = build_provider(&config);
+    let message_builder = build_message_builder(&config);
     let runtime = InMemoryRuntime::with_store(
+        message_builder,
         provider,
         std::sync::Arc::new(StaticPolicy::allow_only(["read_file"])),
         vec![std::sync::Arc::new(ReadWorkspaceTool::new(read_roots))],
@@ -464,32 +522,6 @@ impl Drop for RuntimeStateGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
-}
-
-async fn chat_run() -> Result<()> {
-    let paths = ProjectPaths::discover()?;
-    paths.ensure_all()?;
-    let config = load_config(&paths)?;
-
-    let read_roots = if config.runtime.read_roots.is_empty() {
-        vec![std::env::current_dir().context("failed to determine current directory")?]
-    } else {
-        config.runtime.read_roots.clone()
-    };
-
-    let store = SqliteStore::open(StoreLayout::from_project_paths(&paths))?;
-    let provider = build_provider(&config);
-    let runtime = InMemoryRuntime::with_store(
-        provider,
-        std::sync::Arc::new(StaticPolicy::allow_only(["read_file"])),
-        vec![std::sync::Arc::new(ReadWorkspaceTool::new(read_roots))],
-        store,
-    )
-    .await?;
-
-    let connector = Box::new(StdinConnector::default());
-    connector.run(std::sync::Arc::new(runtime)).await?;
-    Ok(())
 }
 
 fn print_doctor_report(report: &DoctorReport) {

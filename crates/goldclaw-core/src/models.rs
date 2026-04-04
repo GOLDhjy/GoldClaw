@@ -107,6 +107,12 @@ pub struct SessionSummary {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionDetail {
+    pub session: SessionSummary,
+    pub messages: Vec<SessionMessage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionBinding {
     pub session_id: SessionId,
     pub source: EnvelopeSource,
@@ -172,6 +178,12 @@ pub struct SessionMessage {
 
 fn default_message_metadata() -> serde_json::Value {
     serde_json::json!({})
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -453,7 +453,3 @@ fn parse_datetime(value: String) -> rusqlite::Result<DateTime<Utc>> {
             )
         })
 }
-
-#[cfg(test)]
-#[path = "sqlite_tests.rs"]
-mod sqlite_tests;

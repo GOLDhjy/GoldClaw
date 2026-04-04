@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use directories::ProjectDirs;
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -252,69 +252,75 @@ impl GoldClawConfig {
 
 #[derive(Clone, Debug)]
 pub struct ProjectPaths {
-    dirs: ProjectDirs,
+    base: PathBuf,
 }
 
 impl ProjectPaths {
     pub fn discover() -> Result<Self> {
-        let dirs = ProjectDirs::from("com", "GoldClaw", "GoldClaw")
-            .ok_or(ConfigError::ProjectDirsUnavailable)?;
-        Ok(Self { dirs })
+        let home = BaseDirs::new()
+            .ok_or(ConfigError::ProjectDirsUnavailable)?
+            .home_dir()
+            .to_path_buf();
+        Ok(Self {
+            base: home.join(".goldclaw"),
+        })
     }
 
     pub fn ensure_all(&self) -> Result<()> {
-        fs::create_dir_all(self.config_dir())?;
-        fs::create_dir_all(self.data_dir())?;
+        fs::create_dir_all(&self.base)?;
         fs::create_dir_all(self.log_dir())?;
-        fs::create_dir_all(self.cache_dir())?;
         fs::create_dir_all(self.temp_dir())?;
         fs::create_dir_all(self.backup_dir())?;
-        fs::create_dir_all(self.database_dir())?;
         Ok(())
     }
 
-    pub fn config_dir(&self) -> &Path {
-        self.dirs.config_dir()
+    pub fn base_dir(&self) -> &Path {
+        &self.base
     }
 
-    pub fn data_dir(&self) -> &Path {
-        self.dirs.data_local_dir()
+    /// Config, data, and cache all live in the same base directory.
+    pub fn config_dir(&self) -> PathBuf {
+        self.base.clone()
+    }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.base.clone()
+    }
+
+    pub fn cache_dir(&self) -> PathBuf {
+        self.base.clone()
     }
 
     pub fn log_dir(&self) -> PathBuf {
-        self.data_dir().join("logs")
-    }
-
-    pub fn cache_dir(&self) -> &Path {
-        self.dirs.cache_dir()
+        self.base.join("logs")
     }
 
     pub fn temp_dir(&self) -> PathBuf {
-        self.cache_dir().join("tmp")
+        self.base.join("tmp")
     }
 
     pub fn backup_dir(&self) -> PathBuf {
-        self.data_dir().join("backups")
+        self.base.join("backups")
     }
 
     pub fn database_dir(&self) -> PathBuf {
-        self.data_dir().join("db")
+        self.base.clone()
     }
 
     pub fn database_file(&self) -> PathBuf {
-        self.database_dir().join("goldclaw.sqlite3")
+        self.base.join("goldclaw.sqlite3")
     }
 
     pub fn config_file(&self) -> PathBuf {
-        self.config_dir().join("config.toml")
+        self.base.join("config.toml")
     }
 
     pub fn runtime_state_file(&self) -> PathBuf {
-        self.data_dir().join("gateway-state.json")
+        self.base.join("gateway-state.json")
     }
 
     pub fn gateway_log_file(&self) -> PathBuf {
-        self.log_dir().join("gateway.log")
+        self.base.join("logs").join("gateway.log")
     }
 }
 

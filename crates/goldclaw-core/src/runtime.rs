@@ -4,14 +4,18 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use crate::{
-    AssistantEvent, Envelope, GoldClawError, PolicyDecision, Result, RuntimeHealth, SessionMessage,
-    SessionSummary, SubmissionReceipt, ToolInvocation, ToolOutput,
+    AssistantEvent, ChatMessage, Envelope, GoldClawError, PolicyDecision, Result, RuntimeHealth,
+    SessionDetail, SessionMessage, SessionSummary, SubmissionReceipt, ToolInvocation, ToolOutput,
 };
+
+pub trait MessageBuilder: Send + Sync {
+    fn build(&self, history: &[SessionMessage]) -> Vec<ChatMessage>;
+}
 
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn generate(&self, envelope: &Envelope, history: &[SessionMessage]) -> Result<String>;
+    async fn chat(&self, messages: &[ChatMessage]) -> Result<String>;
 }
 
 #[async_trait]
@@ -29,6 +33,7 @@ pub trait Policy: Send + Sync {
 pub trait RuntimeHandle: Send + Sync {
     async fn create_session(&self, title: Option<String>) -> Result<SessionSummary>;
     async fn list_sessions(&self) -> Result<Vec<SessionSummary>>;
+    async fn load_session(&self, session_id: uuid::Uuid) -> Result<SessionDetail>;
     async fn submit(&self, envelope: Envelope) -> Result<SubmissionReceipt>;
     async fn subscribe(
         &self,

@@ -97,10 +97,10 @@ pub fn run_doctor(paths: &ProjectPaths) -> DoctorReport {
 
     let store = StoreLayout::from_project_paths(paths);
     let required_dirs = vec![
-        paths.config_dir().to_path_buf(),
-        paths.data_dir().to_path_buf(),
+        paths.config_dir(),
+        paths.data_dir(),
         paths.log_dir(),
-        paths.cache_dir().to_path_buf(),
+        paths.cache_dir(),
         paths.temp_dir(),
         paths.backup_dir(),
         paths.database_dir(),

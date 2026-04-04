@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use goldclaw_core::{Envelope, GoldClawError, MessageRole, Provider, Result, SessionMessage};
+use goldclaw_core::{ChatMessage, GoldClawError, Provider, Result};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -10,7 +10,6 @@ pub struct GlmProvider {
     client: reqwest::Client,
     model: String,
     api_key: String,
-    system_prompt: Option<String>,
 }
 
 impl GlmProvider {
@@ -25,7 +24,6 @@ impl GlmProvider {
     pub fn from_env_or_config(
         config_api_key: Option<String>,
         config_model: Option<String>,
-        system_prompt: Option<String>,
     ) -> std::result::Result<Self, String> {
         let api_key = std::env::var("BIGMODEL_API_KEY")
             .ok()
@@ -43,7 +41,11 @@ impl GlmProvider {
         let client =
             build_http_client().map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
-        Ok(Self { client, model, api_key, system_prompt })
+        Ok(Self {
+            client,
+            model,
+            api_key,
+        })
     }
 }
 
@@ -100,7 +102,7 @@ struct ApiRequest<'a> {
 
 #[derive(Serialize)]
 struct ApiMessage {
-    role: &'static str,
+    role: String,
     content: String,
 }
 
@@ -127,8 +129,7 @@ impl Provider for GlmProvider {
         "glm"
     }
 
-    async fn generate(&self, _envelope: &Envelope, history: &[SessionMessage]) -> Result<String> {
-        let messages = build_messages(history, self.system_prompt.as_deref());
+    async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
         if messages.is_empty() {
             return Err(GoldClawError::InvalidInput(
                 "no messages to send to GLM".into(),
@@ -140,7 +141,13 @@ impl Provider for GlmProvider {
 
         let body = ApiRequest {
             model: &self.model,
-            messages,
+            messages: messages
+                .iter()
+                .map(|m| ApiMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect(),
         };
 
         let resp = self
@@ -175,52 +182,16 @@ impl Provider for GlmProvider {
     }
 }
 
-// ── Convert session history to GLM messages ───────────────────────────────────
-
-fn build_messages(history: &[SessionMessage], system_prompt: Option<&str>) -> Vec<ApiMessage> {
-    let mut messages: Vec<ApiMessage> = Vec::new();
-
-    // Inject system prompt if the history doesn't already start with one.
-    if let Some(prompt) = system_prompt {
-        let has_system = history.iter().any(|m| m.role == MessageRole::System);
-        if !has_system {
-            messages.push(ApiMessage {
-                role: "system",
-                content: prompt.to_string(),
-            });
-        }
-    }
-
-    for msg in history {
-        let (role, content): (&'static str, String) = match msg.role {
-            MessageRole::System => ("system", msg.content.clone()),
-            MessageRole::User => ("user", msg.content.clone()),
-            MessageRole::Assistant => ("assistant", msg.content.clone()),
-            MessageRole::Tool => ("assistant", format!("[tool output]\n{}", msg.content)),
-        };
-
-        // Merge consecutive same-role messages (GLM requires alternating user/assistant)
-        if let Some(last) = messages.last_mut() {
-            if last.role == role {
-                last.content.push('\n');
-                last.content.push_str(&content);
-                continue;
-            }
-        }
-
-        messages.push(ApiMessage { role, content });
-    }
-
-    messages
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn default_base_url_is_coding_endpoint() {
-        assert_eq!(DEFAULT_BASE_URL, "https://open.bigmodel.cn/api/coding/paas/v4");
+        assert_eq!(
+            DEFAULT_BASE_URL,
+            "https://open.bigmodel.cn/api/coding/paas/v4"
+        );
     }
 
     #[test]
@@ -228,7 +199,10 @@ mod tests {
         assert_eq!(normalize_glm_model("glm-5.1"), Some("GLM-5.1".to_string()));
         assert_eq!(normalize_glm_model("GLM-5.1"), Some("GLM-5.1".to_string()));
         assert_eq!(normalize_glm_model("glm-5"), Some("GLM-5".to_string()));
-        assert_eq!(normalize_glm_model("glm-5v-turbo"), Some("glm-5v-turbo".to_string()));
+        assert_eq!(
+            normalize_glm_model("glm-5v-turbo"),
+            Some("glm-5v-turbo".to_string())
+        );
         assert_eq!(normalize_glm_model("unknown"), None);
     }
 

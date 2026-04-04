@@ -37,6 +37,7 @@ async fn read_tool_rejects_escape() {
 #[tokio::test]
 async fn envelopes_with_same_binding_reuse_session() {
     let runtime = InMemoryRuntime::new(
+        Arc::new(StandardMessageBuilder::new(None)),
         Arc::new(EchoProvider),
         Arc::new(StaticPolicy::allow_only(["read_file"])),
         vec![Arc::new(ReadWorkspaceTool::new(vec![
@@ -67,6 +68,37 @@ async fn envelopes_with_same_binding_reuse_session() {
 }
 
 #[tokio::test]
+async fn load_session_returns_history_for_chat_sessions() {
+    let runtime = InMemoryRuntime::new(
+        Arc::new(StandardMessageBuilder::new(None)),
+        Arc::new(EchoProvider),
+        Arc::new(StaticPolicy::allow_only(["read_file"])),
+        vec![Arc::new(ReadWorkspaceTool::new(vec![
+            env::current_dir().unwrap(),
+        ]))],
+    );
+
+    let session = runtime
+        .create_session(Some("Chat".into()))
+        .await
+        .expect("create session");
+
+    runtime
+        .submit(Envelope::user("hello", EnvelopeSource::Tui, Some(session.id)))
+        .await
+        .expect("submit");
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+    let detail = runtime.load_session(session.id).await.expect("load session");
+    assert_eq!(detail.session.id, session.id);
+    assert_eq!(detail.messages.len(), 2);
+    assert_eq!(detail.messages[0].role, MessageRole::User);
+    assert_eq!(detail.messages[0].content, "hello");
+    assert_eq!(detail.messages[1].role, MessageRole::Assistant);
+    assert_eq!(detail.messages[1].content, "echo: hello");
+}
+
+#[tokio::test]
 async fn sqlite_store_restores_bindings_across_runtime_restart() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -78,6 +110,7 @@ async fn sqlite_store_restores_bindings_across_runtime_restart() {
     let read_root = env::current_dir().expect("workspace dir");
 
     let first_runtime = InMemoryRuntime::with_store(
+        Arc::new(StandardMessageBuilder::new(None)),
         Arc::new(EchoProvider),
         Arc::new(StaticPolicy::allow_only(["read_file"])),
         vec![Arc::new(ReadWorkspaceTool::new(vec![read_root.clone()]))],
@@ -98,6 +131,7 @@ async fn sqlite_store_restores_bindings_across_runtime_restart() {
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
     let second_runtime = InMemoryRuntime::with_store(
+        Arc::new(StandardMessageBuilder::new(None)),
         Arc::new(EchoProvider),
         Arc::new(StaticPolicy::allow_only(["read_file"])),
         vec![Arc::new(ReadWorkspaceTool::new(vec![read_root]))],

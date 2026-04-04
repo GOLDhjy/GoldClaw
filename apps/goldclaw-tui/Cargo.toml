@@ -6,4 +6,12 @@ license.workspace = true
 publish = false
 
 [dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+goldclaw-config = { path = "../../crates/goldclaw-config" }
+goldclaw-core = { path = "../../crates/goldclaw-core" }
 ratatui.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

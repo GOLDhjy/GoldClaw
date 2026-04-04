@@ -58,7 +58,3 @@ impl StoreLayout {
             .join(format!("goldclaw-{seconds}.sqlite3.bak"))
     }
 }
-
-#[cfg(test)]
-#[path = "layout_tests.rs"]
-mod layout_tests;

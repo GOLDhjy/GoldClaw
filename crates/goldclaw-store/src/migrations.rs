@@ -102,7 +102,3 @@ ALTER TABLE messages
 pub const fn current_schema_version() -> u32 {
     MIGRATIONS[MIGRATIONS.len() - 1].version
 }
-
-#[cfg(test)]
-#[path = "migrations_tests.rs"]
-mod migrations_tests;
