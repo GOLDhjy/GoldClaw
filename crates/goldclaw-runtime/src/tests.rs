@@ -1,4 +1,5 @@
 use super::*;
+use goldclaw_core::Tool;
 use goldclaw_core::{MemoryStore, ProviderOutput, ToolDefinition};
 use goldclaw_memory::SqliteMemoryStore;
 use goldclaw_store::{SqliteStore, StoreLayout};
@@ -7,7 +8,6 @@ use std::{
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
-use goldclaw_core::Tool;
 use tools::{BuiltinTool, ReadWorkspaceTool, UpdateSoulTool};
 
 fn temp_store_layout(unique: u128) -> StoreLayout {
@@ -26,7 +26,11 @@ impl Provider for SoulRefreshProvider {
         "soul-refresh"
     }
 
-    async fn chat(&self, messages: &[ChatMessage], _tools: &[ToolDefinition]) -> Result<ProviderOutput> {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+    ) -> Result<ProviderOutput> {
         let mut calls = self.calls.lock().expect("call lock");
         *calls += 1;
 
@@ -424,7 +428,10 @@ async fn provider_can_update_soul_and_see_new_prompt_in_same_turn() {
     assert_eq!(detail.messages.len(), 4);
     assert_eq!(detail.messages[1].role, MessageRole::Assistant);
     assert_eq!(
-        detail.messages[1].metadata.get("kind").and_then(|v| v.as_str()),
+        detail.messages[1]
+            .metadata
+            .get("kind")
+            .and_then(|v| v.as_str()),
         Some("tool_call")
     );
     assert_eq!(detail.messages[2].role, MessageRole::Tool);
@@ -455,7 +462,8 @@ async fn update_soul_tool_writes_and_returns_full_content() {
     fs::write(&soul_path, original).expect("write soul");
 
     let tool = UpdateSoulTool::new(soul_path.clone());
-    let new_content = "# 助手身份\n\n你是 GoldClaw。\n\n# 用户称呼\n\n老板\n\n# 对话风格\n\n稳重点。\n";
+    let new_content =
+        "# 助手身份\n\n你是 GoldClaw。\n\n# 用户称呼\n\n老板\n\n# 对话风格\n\n稳重点。\n";
     let invocation = ToolInvocation {
         session_id: Uuid::new_v4(),
         tool_name: "update_soul".into(),

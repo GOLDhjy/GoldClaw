@@ -212,32 +212,38 @@ fn parse_memory_chunk_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryChu
         .and_then(|s| Uuid::parse_str(&s).ok());
     let content: String = row.get(2)?;
     let embedding = row.get::<_, Option<Vec<u8>>>(3)?.map(|b| blob_to_vec(&b));
-    let created_at: DateTime<Utc> =
-        DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?;
+    let created_at: DateTime<Utc> = DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     let metadata: serde_json::Value =
         serde_json::from_str(&row.get::<_, String>(5)?).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
         })?;
-    Ok(MemoryChunk { id, session_id, content, embedding, created_at, metadata })
+    Ok(MemoryChunk {
+        id,
+        session_id,
+        content,
+        embedding,
+        created_at,
+        metadata,
+    })
 }
 
 fn register_sqlite_vec() {
     static SQLITE_VEC_REGISTRATION: OnceLock<()> = OnceLock::new();
 
     SQLITE_VEC_REGISTRATION.get_or_init(|| {
-        let rc =
-            unsafe { ffi::sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ()))) };
+        let rc = unsafe {
+            ffi::sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())))
+        };
 
         if rc != ffi::SQLITE_OK {
-            warn!(rc, "failed to register sqlite-vec auto-extension; vector recall will fall back to FTS5");
+            warn!(
+                rc,
+                "failed to register sqlite-vec auto-extension; vector recall will fall back to FTS5"
+            );
         }
     });
 }

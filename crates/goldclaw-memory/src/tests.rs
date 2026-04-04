@@ -53,7 +53,11 @@ async fn save_and_recall_fts5() {
     store.save_chunk(chunk.clone()).await.expect("save");
 
     let results = store
-        .recall(MemoryQuery { text: "你好".into(), embedding: None, limit: 5 })
+        .recall(MemoryQuery {
+            text: "你好".into(),
+            embedding: None,
+            limit: 5,
+        })
         .await
         .expect("recall");
 
@@ -84,8 +88,14 @@ async fn save_and_recall_vector() {
         metadata: serde_json::json!({}),
     };
 
-    store.save_chunk(primary.clone()).await.expect("save primary");
-    store.save_chunk(secondary.clone()).await.expect("save secondary");
+    store
+        .save_chunk(primary.clone())
+        .await
+        .expect("save primary");
+    store
+        .save_chunk(secondary.clone())
+        .await
+        .expect("save secondary");
 
     let results = store
         .recall(MemoryQuery {
@@ -143,7 +153,10 @@ VALUES (?1, NULL, ?2, ?3, ?4, '{}')
     .expect("insert chunk");
     conn.execute(
         "INSERT INTO memory_fts (content, chunk_id) VALUES (?1, ?2)",
-        rusqlite::params!["User: migrated\nAssistant: existing row", chunk_id.to_string()],
+        rusqlite::params![
+            "User: migrated\nAssistant: existing row",
+            chunk_id.to_string()
+        ],
     )
     .expect("insert fts");
     drop(conn);
@@ -169,7 +182,11 @@ async fn recall_empty_returns_empty() {
     let (path, store) = temp_db();
 
     let results = store
-        .recall(MemoryQuery { text: "nothing".into(), embedding: None, limit: 5 })
+        .recall(MemoryQuery {
+            text: "nothing".into(),
+            embedding: None,
+            limit: 5,
+        })
         .await
         .expect("recall");
 

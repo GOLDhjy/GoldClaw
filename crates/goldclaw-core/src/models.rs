@@ -206,7 +206,11 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into(), ..Default::default() }
+        Self {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        }
     }
 }
 
@@ -239,7 +243,11 @@ pub struct ToolDefinition {
 #[derive(Clone, Debug)]
 pub enum ProviderOutput {
     Text(String),
-    ToolCall { id: String, name: String, args: serde_json::Value },
+    ToolCall {
+        id: String,
+        name: String,
+        args: serde_json::Value,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

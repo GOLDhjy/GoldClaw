@@ -12,6 +12,8 @@ clap.workspace = true
 dialoguer.workspace = true
 goldclaw-config = { path = "../../crates/goldclaw-config" }
 goldclaw-connector-stdin = { path = "../../crates/goldclaw-connector-stdin" }
+goldclaw-connector-wecom = { path = "../../crates/goldclaw-connector-wecom" }
+goldclaw-connector-weixin = { path = "../../crates/goldclaw-connector-weixin" }
 goldclaw-core = { path = "../../crates/goldclaw-core" }
 goldclaw-doctor = { path = "../../crates/goldclaw-doctor" }
 goldclaw-memory = { path = "../../crates/goldclaw-memory" }

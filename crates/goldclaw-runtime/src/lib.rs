@@ -781,7 +781,10 @@ pub struct StandardMessageBuilder {
 
 impl StandardMessageBuilder {
     pub fn new(system_prompt: Option<String>) -> Self {
-        Self { system_prompt, soul_path: None }
+        Self {
+            system_prompt,
+            soul_path: None,
+        }
     }
 
     pub fn with_soul_path(soul_path: PathBuf) -> Self {
@@ -809,7 +812,11 @@ impl StandardMessageBuilder {
             }
         }
 
-        if sections.is_empty() { None } else { Some(sections.join("\n\n")) }
+        if sections.is_empty() {
+            None
+        } else {
+            Some(sections.join("\n\n"))
+        }
     }
 }
 
@@ -895,7 +902,11 @@ impl Provider for EchoProvider {
         "echo"
     }
 
-    async fn chat(&self, messages: &[ChatMessage], _tools: &[ToolDefinition]) -> Result<ProviderOutput> {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[ToolDefinition],
+    ) -> Result<ProviderOutput> {
         let content = messages
             .iter()
             .rev()
@@ -938,7 +949,6 @@ impl Policy for StaticPolicy {
     }
 }
 
-
 fn parse_read_command(content: &str) -> Option<String> {
     let trimmed = content.trim();
     trimmed
@@ -957,7 +967,6 @@ fn is_legacy_soul_message(message: &SessionMessage) -> bool {
             .and_then(|value| value.as_str())
             == Some("soul")
 }
-
 
 #[cfg(test)]
 mod tests;

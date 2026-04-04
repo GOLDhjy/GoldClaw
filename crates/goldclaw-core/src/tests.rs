@@ -15,7 +15,10 @@ fn memory_chunk_serializes_without_embedding_when_none() {
     };
 
     let json = serde_json::to_value(&chunk).expect("serialize");
-    assert!(json.get("embedding").is_none(), "embedding should be absent when None");
+    assert!(
+        json.get("embedding").is_none(),
+        "embedding should be absent when None"
+    );
     assert_eq!(json["content"], "User: hi\nAssistant: hello");
 }
 

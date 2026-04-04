@@ -83,6 +83,23 @@ cargo run --bin goldclaw -- doctor --json
 cargo run --bin goldclaw -- stop
 ```
 
+实验性微信 connector：
+
+```bash
+# 首次扫码登录，保存 bot token / account id 到 ~/.goldclaw/connectors/weixin/
+cargo run --bin goldclaw -- connector weixin login
+
+# 启动微信 connector
+cargo run --bin goldclaw -- connector weixin run
+```
+
+当前这个微信接入是 spike skeleton：
+
+- 走腾讯 OpenClaw 微信插件同源的二维码登录 + `getupdates` / `sendmessage` 协议
+- 当前只处理直聊文本和语音转文字内容
+- 收到用户消息后，会把 assistant 的最终文本回复回发到微信
+- 还没有做多账号、媒体回发、命令式 connector 管理、doctor 检查和统一 gateway 托管
+
 ## 配置说明
 
 默认配置文件位于 `~/.goldclaw/config.toml`。一个最小示例：
@@ -241,6 +258,7 @@ Assistant: <助手回复>
 - `crates/goldclaw-doctor`：健康检查与诊断报告
 - `crates/goldclaw-provider-glm`：BigModel / GLM provider + embedding provider
 - `crates/goldclaw-connector-stdin`：stdin connector library
+- `crates/goldclaw-connector-weixin`：实验性微信 connector（二维码登录、长轮询收消息、文本回发）
 
 ### Apps
 

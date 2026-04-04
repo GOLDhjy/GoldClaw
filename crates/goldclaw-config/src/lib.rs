@@ -131,6 +131,8 @@ pub struct GoldClawConfig {
     pub runtime: RuntimeSettings,
     #[serde(default)]
     pub provider: ProviderSettings,
+    #[serde(default)]
+    pub connectors: ConnectorSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,6 +158,25 @@ pub struct ProviderSettings {
     pub model: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ConnectorSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wecom: Option<WeComSettings>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WeComSettings {
+    pub bot_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plug_version: Option<String>,
+}
+
 fn default_allowed_origins() -> Vec<String> {
     vec!["http://127.0.0.1".into(), "http://localhost".into()]
 }
@@ -172,6 +193,7 @@ impl Default for GoldClawConfig {
             },
             runtime: RuntimeSettings::default(),
             provider: ProviderSettings::default(),
+            connectors: ConnectorSettings::default(),
         }
     }
 }

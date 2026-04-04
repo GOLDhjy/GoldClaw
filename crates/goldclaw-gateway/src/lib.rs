@@ -58,7 +58,10 @@ impl GatewayServer {
         let router = Router::new()
             .route("/healthz", get(healthz))
             .route("/status", get(status))
-            .route("/sessions", get(list_sessions).post(create_session).options(preflight))
+            .route(
+                "/sessions",
+                get(list_sessions).post(create_session).options(preflight),
+            )
             .route("/sessions/{session_id}", get(load_session))
             .route("/messages", post(submit_message).options(preflight))
             .route("/sessions/{session_id}/events", get(session_events))

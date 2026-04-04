@@ -27,6 +27,12 @@ fn overrides_replace_runtime_and_gateway_settings() {
 }
 
 #[test]
+fn connectors_default_to_disabled() {
+    let config = GoldClawConfig::default();
+    assert!(config.connectors.wecom.is_none());
+}
+
+#[test]
 fn normalize_requires_local_origins_and_existing_roots() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
