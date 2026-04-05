@@ -1,4 +1,11 @@
-use std::{fs, io::ErrorKind, net::TcpStream, path::PathBuf, time::Duration};
+use std::{
+    fs,
+    io::ErrorKind,
+    net::TcpStream,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 use goldclaw_config::{ConfigOverrides, GoldClawConfig, ProjectPaths};
@@ -50,6 +57,13 @@ struct RuntimeState {
     pid: u32,
     bind: String,
     profile: String,
+    started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectorState {
+    pid: u32,
+    name: String,
     started_at: DateTime<Utc>,
 }
 
@@ -232,6 +246,13 @@ pub fn run_doctor(paths: &ProjectPaths) -> DoctorReport {
             ),
         });
 
+        let gateway_reachable = port_open(&config.gateway.bind);
+        checks.push(wecom_connector_config_check(&config));
+        checks.push(wecom_connector_runtime_check(
+            paths,
+            &config,
+            gateway_reachable,
+        ));
         checks.push(gateway_runtime_check(paths, &config.gateway.bind));
     } else {
         checks.push(warn(
@@ -294,7 +315,172 @@ fn gateway_runtime_check(paths: &ProjectPaths, bind: &str) -> HealthCheckResult 
     }
 }
 
+fn wecom_connector_config_check(config: &GoldClawConfig) -> HealthCheckResult {
+    let Some(settings) = config.connectors.wecom.as_ref() else {
+        return pass(
+            "wecom_connector_config",
+            "企微 connector 未配置".into(),
+            "当前未保存企微 long-link connector 配置。".into(),
+        );
+    };
+
+    if !settings.enabled {
+        return pass(
+            "wecom_connector_config",
+            "企微 connector 已配置但未启用".into(),
+            "如需在 `goldclaw start` 时自动启动，请将 `connectors.wecom.enabled` 设为 `true`。"
+                .into(),
+        );
+    }
+
+    let mut missing_fields = Vec::new();
+    if settings.bot_id.trim().is_empty() {
+        missing_fields.push("bot_id");
+    }
+    if settings
+        .secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        missing_fields.push("secret");
+    }
+
+    if !missing_fields.is_empty() {
+        return fail(
+            "wecom_connector_config",
+            "企微 connector 已启用，但配置不完整".into(),
+            format!(
+                "缺少字段: {}。请重新运行 `goldclaw init` 或直接补全 `config.toml`。",
+                missing_fields.join(", ")
+            ),
+        );
+    }
+
+    let mut detail = vec!["企微 long-link connector 已启用。".to_string()];
+    if let Some(ws_url) = settings
+        .ws_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        detail.push(format!("ws_url: {ws_url}"));
+    }
+    if let Some(scene) = settings.scene {
+        detail.push(format!("scene: {scene}"));
+    }
+    if let Some(version) = settings
+        .plug_version
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        detail.push(format!("plug_version: {version}"));
+    }
+
+    pass(
+        "wecom_connector_config",
+        "企微 connector 配置完整且已启用".into(),
+        detail.join(" | "),
+    )
+}
+
+fn wecom_connector_runtime_check(
+    paths: &ProjectPaths,
+    config: &GoldClawConfig,
+    gateway_reachable: bool,
+) -> HealthCheckResult {
+    let state_path = paths.base_dir().join("connector-wecom-state.json");
+    let enabled = config
+        .connectors
+        .wecom
+        .as_ref()
+        .map(|settings| settings.enabled)
+        .unwrap_or(false);
+
+    wecom_connector_runtime_check_with_state(
+        &state_path,
+        load_connector_state(&state_path),
+        enabled,
+        gateway_reachable,
+    )
+}
+
+fn wecom_connector_runtime_check_with_state(
+    state_path: &Path,
+    state: Option<Result<ConnectorState, String>>,
+    enabled: bool,
+    gateway_reachable: bool,
+) -> HealthCheckResult {
+    if !enabled {
+        return match state {
+            Some(Ok(state)) if process_alive(state.pid) => warn(
+                "wecom_connector_runtime",
+                "企微 connector 已禁用，但进程仍在运行".into(),
+                format!(
+                    "检测到 pid {} 仍在运行。建议执行 `goldclaw stop`，或手动停止该 connector 进程。",
+                    state.pid
+                ),
+            ),
+            Some(Err(error)) => warn(
+                "wecom_connector_runtime",
+                "企微 connector 已禁用，但状态文件损坏".into(),
+                format!("无法解析 {}: {}", state_path.display(), error),
+            ),
+            _ => pass(
+                "wecom_connector_runtime",
+                "企微 connector 未启用，跳过运行检查".into(),
+                "当前不会在 `goldclaw start` 时自动拉起企微 connector。".into(),
+            ),
+        };
+    }
+
+    match state {
+        Some(Ok(state)) if process_alive(state.pid) => pass(
+            "wecom_connector_runtime",
+            "企微 connector 正在运行".into(),
+            format!(
+                "connector `{}` 正以 pid {} 运行，启动于 {}。",
+                state.name, state.pid, state.started_at
+            ),
+        ),
+        Some(Ok(state)) => warn(
+            "wecom_connector_runtime",
+            "企微 connector 状态文件存在，但进程不可达".into(),
+            format!(
+                "记录的 pid 为 {}。建议运行 `goldclaw stop` 清理后重新 `goldclaw start`。",
+                state.pid
+            ),
+        ),
+        Some(Err(error)) => warn(
+            "wecom_connector_runtime",
+            "企微 connector 状态文件损坏".into(),
+            format!("无法解析 {}: {}", state_path.display(), error),
+        ),
+        None if gateway_reachable => warn(
+            "wecom_connector_runtime",
+            "企微 connector 已启用，但尚未启动".into(),
+            format!(
+                "gateway 端口已可达，但 {} 不存在。请检查启动日志或重新执行 `goldclaw start`。",
+                state_path.display()
+            ),
+        ),
+        None => warn(
+            "wecom_connector_runtime",
+            "企微 connector 已启用，但 gateway 未运行".into(),
+            "该 connector 会在 `goldclaw start` 时自动拉起；当前 gateway 不可达。".into(),
+        ),
+    }
+}
+
 fn load_runtime_state(path: &PathBuf) -> Option<Result<RuntimeState, String>> {
+    match fs::read_to_string(path) {
+        Ok(raw) => Some(serde_json::from_str(&raw).map_err(|error| error.to_string())),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => Some(Err(error.to_string())),
+    }
+}
+
+fn load_connector_state(path: &PathBuf) -> Option<Result<ConnectorState, String>> {
     match fs::read_to_string(path) {
         Ok(raw) => Some(serde_json::from_str(&raw).map_err(|error| error.to_string())),
         Err(error) if error.kind() == ErrorKind::NotFound => None,
@@ -307,6 +493,31 @@ fn port_open(bind: &str) -> bool {
         return false;
     };
     TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| !line.trim().is_empty() && !line.contains("No tasks"))
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
 }
 
 fn join_paths(paths: &[PathBuf]) -> String {

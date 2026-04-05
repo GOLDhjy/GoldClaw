@@ -166,6 +166,8 @@ pub struct ConnectorSettings {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WeComSettings {
+    #[serde(default)]
+    pub enabled: bool,
     pub bot_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,

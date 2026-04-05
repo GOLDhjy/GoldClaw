@@ -10,14 +10,14 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use dialoguer::{Input, Password, Select};
+use dialoguer::{Input, Password};
 use goldclaw_config::{
     AgentSettings, ConnectorSettings, GatewaySettings, GoldClawConfig, ProjectPaths,
     ProviderSettings, RuntimeSettings, WeComSettings,
 };
 use goldclaw_connector_wecom::{WeComConnector, WeComConnectorConfig};
 use goldclaw_connector_weixin::{WeixinConnector, WeixinConnectorConfig};
-use goldclaw_core::Connector as _;
+use goldclaw_core::{Connector as _, RuntimeHandle as _};
 use goldclaw_doctor::{DoctorReport, HealthStatus, run_doctor};
 use goldclaw_gateway::{GatewayConfig, GatewayServer};
 use goldclaw_memory::SqliteMemoryStore;
@@ -29,6 +29,9 @@ use goldclaw_runtime::{
 use goldclaw_store::{SqliteStore, StoreLayout, current_schema_version};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
+
+mod gateway_handle;
+use gateway_handle::GatewayHandle;
 
 #[derive(Parser, Debug)]
 #[command(name = "goldclaw", version, about = "GoldClaw local AI assistant")]
@@ -105,6 +108,13 @@ struct RuntimeState {
     pid: u32,
     bind: String,
     profile: String,
+    started_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ConnectorState {
+    pid: u32,
+    name: String,
     started_at: DateTime<Utc>,
 }
 
@@ -216,67 +226,7 @@ fn init_config(_force: bool) -> Result<()> {
 
     println!("\n── 渠道接入 ─────────────────────────────");
 
-    let connectors = match prompt_connector_selection(existing.connectors.wecom.is_some())? {
-        InitConnectorChoice::None => ConnectorSettings::default(),
-        InitConnectorChoice::WeCom => {
-            let existing_wecom = existing.connectors.wecom.as_ref();
-            let bot_id = prompt_text(
-                "企微 Bot ID",
-                existing_wecom.map(|settings| settings.bot_id.clone()),
-                false,
-            )?;
-            let secret_input = prompt_secret(
-                if existing_wecom
-                    .and_then(|settings| settings.secret.as_ref())
-                    .is_some()
-                {
-                    "企微 Secret（留空保持不变）"
-                } else {
-                    "企微 Secret"
-                },
-                existing_wecom
-                    .and_then(|settings| settings.secret.as_ref())
-                    .is_some(),
-            )?;
-
-            let secret = if secret_input.trim().is_empty() {
-                existing_wecom.and_then(|settings| settings.secret.clone())
-            } else {
-                Some(secret_input)
-            };
-
-            let bot_id = bot_id.trim().to_string();
-            if bot_id.is_empty() {
-                bail!("企微 Bot ID 不能为空");
-            }
-            if secret.as_deref().unwrap_or("").trim().is_empty() {
-                bail!("企微 Secret 不能为空");
-            }
-
-            let ws_url = prompt_optional_text(
-                "企微 WebSocket 地址（可选，默认官方地址）",
-                existing_wecom.and_then(|settings| settings.ws_url.clone()),
-            )?;
-            let scene = prompt_optional_u32(
-                "企微 Scene（可选）",
-                existing_wecom.and_then(|settings| settings.scene),
-            )?;
-            let plug_version = prompt_optional_text(
-                "企微 Plug Version（可选）",
-                existing_wecom.and_then(|settings| settings.plug_version.clone()),
-            )?;
-
-            ConnectorSettings {
-                wecom: Some(WeComSettings {
-                    bot_id,
-                    secret,
-                    ws_url,
-                    scene,
-                    plug_version,
-                }),
-            }
-        }
-    };
+    let connectors = prompt_connectors(&existing.connectors)?;
 
     println!();
 
@@ -340,10 +290,16 @@ fn init_config(_force: bool) -> Result<()> {
         sqlite.applied_schema_version()?,
         current_schema_version()
     );
-    if config.connectors.wecom.is_some() {
-        println!("已配置企微长连接 connector。后续可直接运行 `goldclaw connector wecom run`。");
-    } else {
-        println!("当前未启用任何外部渠道 connector。");
+    match config.connectors.wecom.as_ref() {
+        Some(settings) if settings.enabled => {
+            println!("已启用企微长连接 connector。后续运行 `goldclaw start` 时会自动启动。");
+        }
+        Some(_) => {
+            println!("已保存企微长连接 connector 配置，但当前未启用。");
+        }
+        None => {
+            println!("当前未启用任何外部渠道 connector。");
+        }
     }
 
     println!("\n正在启动后台服务...");
@@ -363,12 +319,6 @@ struct SoulAnswers {
     assistant_name: String,
     language: String,
     conversation_style: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InitConnectorChoice {
-    None,
-    WeCom,
 }
 
 fn default_soul_answers(agent_name: &str) -> SoulAnswers {
@@ -482,17 +432,83 @@ fn prompt_secret(prompt: &str, allow_empty: bool) -> Result<String> {
         .map_err(Into::into)
 }
 
-fn prompt_connector_selection(existing_wecom_enabled: bool) -> Result<InitConnectorChoice> {
-    let options = ["暂不接入渠道", "企业微信（长连接机器人）"];
-    let selection = Select::new()
-        .with_prompt("要接入哪个渠道")
-        .items(options)
-        .default(if existing_wecom_enabled { 1 } else { 0 })
+fn prompt_connectors(existing: &ConnectorSettings) -> Result<ConnectorSettings> {
+    use dialoguer::MultiSelect;
+
+    let options = ["企业微信（长连接机器人）"];
+    let defaults = [existing.wecom.as_ref().map(|w| w.enabled).unwrap_or(false)];
+
+    let selections = MultiSelect::new()
+        .with_prompt("选择要激活的渠道（空格选中，回车确认）")
+        .items(&options)
+        .defaults(&defaults)
         .interact()?;
 
-    Ok(match selection {
-        1 => InitConnectorChoice::WeCom,
-        _ => InitConnectorChoice::None,
+    let wecom_enabled = selections.contains(&0);
+
+    let wecom = if wecom_enabled {
+        Some(prompt_wecom_settings(existing.wecom.as_ref())?)
+    } else if let Some(mut existing_wecom) = existing.wecom.clone() {
+        // Keep credentials but mark disabled.
+        existing_wecom.enabled = false;
+        Some(existing_wecom)
+    } else {
+        None
+    };
+
+    Ok(ConnectorSettings { wecom })
+}
+
+fn wecom_connector_enabled(connectors: &ConnectorSettings) -> bool {
+    connectors
+        .wecom
+        .as_ref()
+        .map(|settings| settings.enabled)
+        .unwrap_or(false)
+}
+
+fn prompt_wecom_settings(existing: Option<&WeComSettings>) -> Result<WeComSettings> {
+    let bot_id = prompt_text("企微 Bot ID", existing.map(|s| s.bot_id.clone()), false)?;
+
+    let secret_input = prompt_secret(
+        if existing.and_then(|s| s.secret.as_ref()).is_some() {
+            "企微 Secret（留空保持不变）"
+        } else {
+            "企微 Secret"
+        },
+        existing.and_then(|s| s.secret.as_ref()).is_some(),
+    )?;
+    let secret = if secret_input.trim().is_empty() {
+        existing.and_then(|s| s.secret.clone())
+    } else {
+        Some(secret_input)
+    };
+
+    let bot_id = bot_id.trim().to_string();
+    if bot_id.is_empty() {
+        bail!("企微 Bot ID 不能为空");
+    }
+    if secret.as_deref().unwrap_or("").trim().is_empty() {
+        bail!("企微 Secret 不能为空");
+    }
+
+    let ws_url = prompt_optional_text(
+        "企微 WebSocket 地址（可选，默认官方地址）",
+        existing.and_then(|s| s.ws_url.clone()),
+    )?;
+    let scene = prompt_optional_u32("企微 Scene（可选）", existing.and_then(|s| s.scene))?;
+    let plug_version = prompt_optional_text(
+        "企微 Plug Version（可选）",
+        existing.and_then(|s| s.plug_version.clone()),
+    )?;
+
+    Ok(WeComSettings {
+        enabled: true,
+        bot_id,
+        secret,
+        ws_url,
+        scene,
+        plug_version,
     })
 }
 
@@ -551,6 +567,7 @@ mod tests {
         let config = GoldClawConfig {
             connectors: ConnectorSettings {
                 wecom: Some(WeComSettings {
+                    enabled: true,
                     bot_id: "bot-from-config".into(),
                     secret: Some("secret-from-config".into()),
                     ws_url: Some("wss://example.test/ws".into()),
@@ -576,6 +593,7 @@ mod tests {
         let config = GoldClawConfig {
             connectors: ConnectorSettings {
                 wecom: Some(WeComSettings {
+                    enabled: true,
                     bot_id: "bot-from-config".into(),
                     secret: Some("secret-from-config".into()),
                     ws_url: None,
@@ -724,11 +742,108 @@ fn start_gateway() -> Result<()> {
         println!("\n打开浏览器开始对话: http://{web_bind}  (需先安装 goldclaw-web)");
     }
 
+    // Start WeCom connector only when it is explicitly enabled.
+    if wecom_connector_enabled(&config.connectors) {
+        start_wecom_connector(&paths, &exe)?;
+    }
+
+    Ok(())
+}
+
+fn start_wecom_connector(paths: &ProjectPaths, exe: &std::path::Path) -> Result<()> {
+    let state_path = paths.base_dir().join("connector-wecom-state.json");
+
+    // Already running?
+    if let Ok(raw) = fs::read_to_string(&state_path) {
+        if let Ok(state) = serde_json::from_str::<ConnectorState>(&raw) {
+            if Command::new("kill")
+                .args(["-0", &state.pid.to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                println!("GoldClaw wecom  已在运行 (pid {})", state.pid);
+                return Ok(());
+            }
+        }
+    }
+
+    let log_path = paths.log_dir().join("connector-wecom.log");
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open {}", log_path.display()))?;
+    let err_file = log_file.try_clone()?;
+
+    let mut cmd = Command::new(exe);
+    cmd.args(["connector", "wecom", "run"]);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::from(log_file));
+    cmd.stderr(Stdio::from(err_file));
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    let child = cmd.spawn().context("failed to spawn wecom connector")?;
+    let pid = child.id();
+
+    let state = ConnectorState {
+        pid,
+        name: "wecom".into(),
+        started_at: Utc::now(),
+    };
+    fs::write(&state_path, serde_json::to_string_pretty(&state)?)?;
+
+    std::thread::sleep(Duration::from_millis(500));
+    println!("GoldClaw wecom  已启动 (pid {pid})");
+    println!("connector 日志: {}", log_path.display());
+
+    Ok(())
+}
+
+fn stop_wecom_connector(paths: &ProjectPaths) -> Result<()> {
+    let state_path = paths.base_dir().join("connector-wecom-state.json");
+    let Ok(raw) = fs::read_to_string(&state_path) else {
+        return Ok(());
+    };
+    let Ok(state) = serde_json::from_str::<ConnectorState>(&raw) else {
+        let _ = fs::remove_file(&state_path);
+        return Ok(());
+    };
+
+    #[cfg(windows)]
+    let status = Command::new("taskkill")
+        .args(["/PID", &state.pid.to_string(), "/T", "/F"])
+        .status()
+        .context("failed to invoke taskkill")?;
+
+    #[cfg(not(windows))]
+    let status = Command::new("kill")
+        .arg(state.pid.to_string())
+        .status()
+        .context("failed to invoke kill")?;
+
+    let _ = fs::remove_file(&state_path);
+
+    if status.success() {
+        println!("GoldClaw wecom  已停止。");
+    }
+
     Ok(())
 }
 
 fn stop_gateway() -> Result<()> {
     let paths = ProjectPaths::discover()?;
+
+    // Stop connectors first.
+    stop_wecom_connector(&paths)?;
+
     let Some(state) = load_runtime_state(&paths)? else {
         println!("GoldClaw gateway 当前未运行。");
         return Ok(());
@@ -845,7 +960,7 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
     };
     write_runtime_state(&paths, &runtime_state)?;
     let _state_guard = RuntimeStateGuard::new(paths.runtime_state_file());
-    let runtime = build_runtime(&paths, &config)?;
+    let runtime = build_runtime(&paths, &config).await?;
 
     let gateway = GatewayServer::new(GatewayConfig {
         bind,
@@ -859,7 +974,7 @@ async fn gateway_run(bind_override: Option<String>) -> Result<()> {
         .await
 }
 
-fn build_runtime(paths: &ProjectPaths, config: &GoldClawConfig) -> Result<InMemoryRuntime> {
+async fn build_runtime(paths: &ProjectPaths, config: &GoldClawConfig) -> Result<InMemoryRuntime> {
     let read_roots = if config.runtime.read_roots.is_empty() {
         vec![std::env::current_dir().context("failed to determine current directory")?]
     } else {
@@ -883,21 +998,27 @@ fn build_runtime(paths: &ProjectPaths, config: &GoldClawConfig) -> Result<InMemo
     let embedding_provider: Option<std::sync::Arc<dyn goldclaw_core::EmbeddingProvider>> =
         build_embedding_provider(config);
 
+    let store_layout = StoreLayout::from_project_paths(paths);
+    let sqlite = SqliteStore::open(store_layout).context("failed to open session store")?;
+
     tracing::info!(
         soul_enabled = soul_path.exists(),
         embedding_enabled = embedding_provider.is_some(),
         memory_enabled = memory_store.is_some(),
-        "starting runtime (sessions: in-memory, memory: persisted)"
+        "starting runtime (sessions: persisted, memory: persisted)"
     );
 
-    Ok(InMemoryRuntime::with_memory(
+    InMemoryRuntime::with_store_and_memory(
         message_builder,
         provider,
         std::sync::Arc::new(StaticPolicy::allow_only(["read_file", "update_soul"])),
         builtin_tools,
+        sqlite,
         embedding_provider,
         memory_store,
-    ))
+    )
+    .await
+    .map_err(Into::into)
 }
 
 async fn weixin_login() -> Result<()> {
@@ -912,12 +1033,17 @@ async fn weixin_run() -> Result<()> {
     let paths = ProjectPaths::discover()?;
     paths.ensure_all()?;
     let config = load_config(&paths)?;
-    let runtime = build_runtime(&paths, &config)?;
     let connector = build_weixin_connector(&paths);
+
+    let handle = GatewayHandle::new(&config.gateway.bind);
+    handle
+        .health()
+        .await
+        .map_err(|_| anyhow!("Gateway 未运行。请先执行 `goldclaw start`。"))?;
 
     println!("微信 connector 已启动，按 Ctrl-C 退出。");
     Box::new(connector)
-        .run(std::sync::Arc::new(runtime))
+        .run(std::sync::Arc::new(handle))
         .await
         .map_err(Into::into)
 }
@@ -932,13 +1058,18 @@ async fn wecom_run(
     let paths = ProjectPaths::discover()?;
     paths.ensure_all()?;
     let config = load_config(&paths)?;
-    let runtime = build_runtime(&paths, &config)?;
     let connector_config =
         resolve_wecom_connector_config(&config, bot_id, secret, ws_url, scene, plug_version)?;
 
+    let handle = GatewayHandle::new(&config.gateway.bind);
+    handle
+        .health()
+        .await
+        .map_err(|_| anyhow!("Gateway 未运行。请先执行 `goldclaw start`。"))?;
+
     println!("企微 long-link connector 已启动，按 Ctrl-C 退出。");
     Box::new(WeComConnector::new(connector_config))
-        .run(std::sync::Arc::new(runtime))
+        .run(std::sync::Arc::new(handle))
         .await
         .map_err(Into::into)
 }

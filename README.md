@@ -266,6 +266,84 @@ Assistant: <助手回复>
 - `apps/goldclaw-tui`：终端 UI
 - `apps/goldclaw-web`：本地 Web UI
 
+## 数据库查询
+
+数据库位于 `~/.goldclaw/goldclaw.sqlite3`，可用 `sqlite3` 命令直接查询。
+
+### 查看最近的记忆片段
+
+```bash
+sqlite3 ~/.goldclaw/goldclaw.sqlite3 \
+  "SELECT substr(content, 1, 120) as preview, created_at
+   FROM memory_chunks
+   ORDER BY created_at DESC
+   LIMIT 20;"
+```
+
+### 按关键词搜索记忆（FTS5）
+
+```bash
+sqlite3 ~/.goldclaw/goldclaw.sqlite3 \
+  "SELECT substr(mc.content, 1, 200) as preview, mc.created_at
+   FROM memory_fts
+   JOIN memory_chunks mc ON memory_fts.chunk_id = mc.id
+   WHERE memory_fts MATCH '旅游'
+   ORDER BY rank
+   LIMIT 10;"
+```
+
+### 查看所有会话
+
+```bash
+sqlite3 ~/.goldclaw/goldclaw.sqlite3 \
+  "SELECT id, title, created_at, updated_at
+   FROM sessions
+   ORDER BY updated_at DESC;"
+```
+
+### 查看某个会话的消息历史
+
+```bash
+sqlite3 ~/.goldclaw/goldclaw.sqlite3 \
+  "SELECT role, substr(content, 1, 120) as preview, created_at
+   FROM messages
+   WHERE session_id = 'REPLACE_WITH_SESSION_ID'
+   ORDER BY created_at;"
+```
+
+### 查看会话绑定（connector 与 session 的映射）
+
+```bash
+sqlite3 ~/.goldclaw/goldclaw.sqlite3 \
+  "SELECT binding_key, session_id, created_at
+   FROM session_bindings
+   ORDER BY created_at DESC;"
+```
+
+### 统计记忆总量
+
+```bash
+sqlite3 ~/.goldclaw/goldclaw.sqlite3 \
+  "SELECT COUNT(*) as total, MIN(created_at) as oldest, MAX(created_at) as newest
+   FROM memory_chunks;"
+```
+
+### 删除所有记忆（慎用）
+
+```bash
+sqlite3 ~/.goldclaw/goldclaw.sqlite3 \
+  "DELETE FROM memory_chunks; DELETE FROM memory_fts; DELETE FROM memory_vec_chunks;"
+```
+### 查看完整数据库消息
+
+```bash
+sqlite3 ~/.goldclaw/goldclaw.sqlite3 \
+          "SELECT s.id, s.title, s.created_at, m.role, m.content, m.created_at as msg_time
+       FROM sessions s
+       JOIN messages m ON m.session_id = s.id
+       ORDER BY s.created_at, m.created_at;"
+```
+
 ## 开发命令
 
 ```bash

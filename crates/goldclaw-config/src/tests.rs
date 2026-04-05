@@ -33,6 +33,27 @@ fn connectors_default_to_disabled() {
 }
 
 #[test]
+fn wecom_settings_default_to_disabled_when_field_is_missing() {
+    let raw = r#"
+version = 1
+profile = "default"
+
+[gateway]
+bind = "127.0.0.1:4263"
+
+[runtime]
+read_roots = []
+
+[connectors.wecom]
+bot_id = "bot-1"
+secret = "secret-1"
+"#;
+
+    let config: GoldClawConfig = toml::from_str(raw).expect("parse config");
+    assert!(!config.connectors.wecom.expect("wecom settings").enabled);
+}
+
+#[test]
 fn normalize_requires_local_origins_and_existing_roots() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
