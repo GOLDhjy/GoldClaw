@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::SystemTime,
 };
 
@@ -10,7 +10,8 @@ use goldclaw_core::{
     EnvelopeSource, GoldClawError, MessageRole, SessionBinding, SessionId, SessionMessage,
     SessionSummary,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, ffi, params};
+use sqlite_vec::sqlite3_vec_init;
 use thiserror::Error;
 
 use crate::{MIGRATIONS, StoreLayout, current_schema_version};
@@ -83,6 +84,7 @@ impl SqliteStore {
     }
 
     pub fn open(layout: StoreLayout) -> StoreResult<Self> {
+        register_sqlite_vec();
         layout.ensure_parent_dirs()?;
         let database_file = layout.paths().database_file.clone();
         let database_exists = database_file.exists();
@@ -452,4 +454,16 @@ fn parse_datetime(value: String) -> rusqlite::Result<DateTime<Utc>> {
                 Box::new(error),
             )
         })
+}
+
+fn register_sqlite_vec() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let rc = unsafe {
+            ffi::sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())))
+        };
+        if rc != ffi::SQLITE_OK {
+            eprintln!("goldclaw-store: failed to register sqlite-vec auto-extension (rc={rc})");
+        }
+    });
 }

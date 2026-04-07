@@ -119,6 +119,13 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 );
 "#,
     },
+    Migration {
+        version: 5,
+        name: "rebuild_memory_vec_for_qwen",
+        sql: r#"
+DROP TABLE IF EXISTS memory_vec_chunks;
+"#,
+    },
 ];
 
 pub const fn current_schema_version() -> u32 {

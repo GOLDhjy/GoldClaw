@@ -22,9 +22,10 @@ use goldclaw_doctor::{DoctorReport, HealthStatus, run_doctor};
 use goldclaw_gateway::{GatewayConfig, GatewayServer};
 use goldclaw_memory::SqliteMemoryStore;
 use goldclaw_provider_glm::GlmProvider;
+use goldclaw_provider_qwen::QwenEmbeddingProvider;
 use goldclaw_runtime::{
     EchoProvider, InMemoryRuntime, StandardMessageBuilder, StaticPolicy,
-    tools::{BuiltinTool, ReadWorkspaceTool, UpdateSoulTool},
+    tools::{BashCheckTool, BashExecTool, BuiltinTool, EditFileTool, ReadWorkspaceTool, UpdateSoulTool, WriteFileTool},
 };
 use goldclaw_store::{SqliteStore, StoreLayout, current_schema_version};
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,16 @@ enum Commands {
         #[command(subcommand)]
         command: GatewayCommand,
     },
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCommand {
+    /// Re-embed memory chunks that are missing or have wrong-dimension embeddings.
+    Reembed,
 }
 
 #[derive(Subcommand, Debug)]
@@ -153,6 +164,9 @@ async fn main() -> Result<()> {
         Commands::Gateway { command } => match command {
             GatewayCommand::Run { bind } => gateway_run(bind).await?,
         },
+        Commands::Memory { command } => match command {
+            MemoryCommand::Reembed => memory_reembed().await?,
+        },
     }
 
     Ok(())
@@ -197,13 +211,86 @@ fn init_config(_force: bool) -> Result<()> {
 
     println!("── Provider ────────────────────────────");
 
-    let api_key = prompt_text(
-        "BigModel API key (留空保持不变)",
-        existing.provider.api_key.clone(),
-        true,
-    )?;
+    // ── Chat provider ──
+    let chat_choices = &["GLM (BigModel)", "Qwen (DashScope)"];
+    let chat_default = if existing.provider.chat_provider.as_deref() == Some("qwen") { 1 } else { 0 };
+    let chat_choice = dialoguer::Select::new()
+        .with_prompt("聊天模型")
+        .items(chat_choices)
+        .default(chat_default)
+        .interact()?;
+    let chat_provider = if chat_choice == 0 { "glm" } else { "qwen" };
 
-    let api_key = api_key.trim().to_string();
+    let glm_api_key = if chat_choice == 0 {
+        prompt_text("BigModel (GLM) API key (留空保持不变)", existing.provider.glm_api_key.clone(), true)?
+            .trim()
+            .to_string()
+    } else {
+        existing.provider.glm_api_key.clone().unwrap_or_default()
+    };
+
+    let glm_model = if chat_choice == 0 {
+        prompt_text("GLM 模型（默认 GLM-5.1）", existing.provider.glm_model.clone(), true)?
+            .trim()
+            .to_string()
+    } else {
+        existing.provider.glm_model.clone().unwrap_or_default()
+    };
+
+    let qwen_api_key_for_chat = if chat_choice == 1 {
+        prompt_text("DashScope API key (留空保持不变)", existing.provider.qwen_api_key.clone(), true)?
+            .trim()
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    let qwen_model = if chat_choice == 1 {
+        prompt_text("Qwen 模型（默认 qwen-plus）", existing.provider.qwen_model.clone(), true)?
+            .trim()
+            .to_string()
+    } else {
+        existing.provider.qwen_model.clone().unwrap_or_default()
+    };
+
+    // ── Embedding provider ──
+    let embed_choices = &["Qwen (DashScope)", "GLM (BigModel)", "不启用"];
+    let embed_default = match existing.provider.embedding_provider.as_deref() {
+        Some("qwen") => 0,
+        Some("glm") => 1,
+        _ => 2,
+    };
+    let embed_choice = dialoguer::Select::new()
+        .with_prompt("Embedding 提供商（记忆语义检索）")
+        .items(embed_choices)
+        .default(embed_default)
+        .interact()?;
+    let embedding_provider = match embed_choice {
+        0 => "qwen",
+        1 => "glm",
+        _ => "none",
+    };
+
+    // If embedding uses qwen but chat uses glm, we need the DashScope key.
+    let qwen_api_key_for_embed = if embed_choice == 0 && chat_choice != 1 {
+        prompt_text("DashScope API key (Embedding 用，留空保持不变)", existing.provider.qwen_api_key.clone(), true)?
+            .trim()
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    // Merge: chat key takes priority, fall back to embed key, fall back to existing.
+    let qwen_api_key = {
+        let key = if !qwen_api_key_for_chat.is_empty() {
+            qwen_api_key_for_chat
+        } else if !qwen_api_key_for_embed.is_empty() {
+            qwen_api_key_for_embed
+        } else {
+            String::new()
+        };
+        if key.is_empty() { existing.provider.qwen_api_key.clone() } else { Some(key) }
+    };
 
     println!("\n── 网关 ────────────────────────────────");
 
@@ -250,12 +337,12 @@ fn init_config(_force: bool) -> Result<()> {
             read_roots: vec![PathBuf::from(read_root)],
         },
         provider: ProviderSettings {
-            api_key: if api_key.is_empty() {
-                None
-            } else {
-                Some(api_key)
-            },
-            model: existing.provider.model,
+            chat_provider: Some(chat_provider.into()),
+            embedding_provider: Some(embedding_provider.into()),
+            glm_api_key: if glm_api_key.is_empty() { None } else { Some(glm_api_key) },
+            glm_model: if glm_model.is_empty() { None } else { Some(glm_model) },
+            qwen_api_key,
+            qwen_model: if qwen_model.is_empty() { None } else { Some(qwen_model) },
         },
         connectors,
     };
@@ -909,12 +996,27 @@ fn show_status() -> Result<()> {
 }
 
 fn build_provider(config: &GoldClawConfig) -> std::sync::Arc<dyn goldclaw_core::Provider> {
+    let chat_provider = config.provider.chat_provider.as_deref().unwrap_or("glm");
+
+    if chat_provider == "qwen" {
+        match goldclaw_provider_qwen::QwenChatProvider::from_env_or_config(
+            config.provider.qwen_api_key.clone(),
+            config.provider.qwen_model.clone(),
+        ) {
+            Ok(p) => {
+                tracing::info!("using Qwen chat provider");
+                return std::sync::Arc::new(p);
+            }
+            Err(reason) => tracing::warn!(%reason, "Qwen chat provider unavailable, falling back"),
+        }
+    }
+
     match GlmProvider::from_env_or_config(
-        config.provider.api_key.clone(),
-        config.provider.model.clone(),
+        config.provider.glm_api_key.clone(),
+        config.provider.glm_model.clone(),
     ) {
         Ok(p) => {
-            tracing::info!("using GLM provider");
+            tracing::info!("using GLM chat provider");
             std::sync::Arc::new(p)
         }
         Err(reason) => {
@@ -933,13 +1035,98 @@ fn build_message_builder(
 fn build_embedding_provider(
     config: &GoldClawConfig,
 ) -> Option<std::sync::Arc<dyn goldclaw_core::EmbeddingProvider>> {
-    match goldclaw_provider_glm::GlmProvider::from_env_or_config(
-        config.provider.api_key.clone(),
-        config.provider.model.clone(),
-    ) {
-        Ok(p) => Some(std::sync::Arc::new(p)),
-        Err(_) => None,
+    let embed_provider = config.provider.embedding_provider.as_deref().unwrap_or("none");
+
+    match embed_provider {
+        "qwen" => {
+            match QwenEmbeddingProvider::from_env_or_config(config.provider.qwen_api_key.clone()) {
+                Ok(p) => {
+                    tracing::info!("using Qwen embedding provider");
+                    Some(std::sync::Arc::new(p))
+                }
+                Err(e) => {
+                    tracing::warn!("Qwen embedding unavailable: {e}; memory recall will fall back to FTS5");
+                    None
+                }
+            }
+        }
+        "glm" => {
+            match GlmProvider::from_env_or_config(
+                config.provider.glm_api_key.clone(),
+                config.provider.glm_model.clone(),
+            ) {
+                Ok(p) => {
+                    tracing::info!("using GLM embedding provider");
+                    Some(std::sync::Arc::new(p))
+                }
+                Err(e) => {
+                    tracing::warn!("GLM embedding unavailable: {e}; memory recall will fall back to FTS5");
+                    None
+                }
+            }
+        }
+        _ => {
+            tracing::info!("embedding provider disabled; memory recall will use FTS5 only");
+            None
+        }
     }
+}
+
+async fn memory_reembed() -> Result<()> {
+    let paths = ProjectPaths::discover()?;
+    let config = load_config(&paths)?;
+
+    let embed_provider = build_embedding_provider(&config)
+        .ok_or_else(|| anyhow!("no embedding provider configured; set embedding_provider in config"))?;
+
+    let db_path = paths.database_file();
+    let conn = rusqlite::Connection::open(&db_path)
+        .context("failed to open database")?;
+
+    let expected_blob_len = goldclaw_memory::MEMORY_VEC_DIMENSIONS * 4;
+
+    let chunks: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, content FROM memory_chunks WHERE embedding IS NULL OR length(embedding) != ?1",
+        )?;
+        stmt.query_map(rusqlite::params![expected_blob_len as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?
+    };
+
+    if chunks.is_empty() {
+        println!("所有记忆块都已有正确维度的 embedding，无需补充。");
+        return Ok(());
+    }
+
+    println!("找到 {} 条记忆块需要重新嵌入...", chunks.len());
+    let mut success = 0usize;
+    let mut failed = 0usize;
+
+    for (id, content) in &chunks {
+        match embed_provider.embed(content).await {
+            Ok(embedding) => {
+                let blob: Vec<u8> = embedding.iter().flat_map(|x| x.to_le_bytes()).collect();
+                conn.execute(
+                    "UPDATE memory_chunks SET embedding = ?1 WHERE id = ?2",
+                    rusqlite::params![blob, id],
+                )?;
+                success += 1;
+                if success % 10 == 0 {
+                    println!("  已完成 {}/{}", success, chunks.len());
+                }
+            }
+            Err(e) => {
+                tracing::warn!(chunk_id = %id, "failed to embed chunk: {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    println!("完成：{} 成功，{} 失败。", success, failed);
+    println!("重新嵌入完成，请重启 gateway 以重建向量索引：goldclaw restart");
+    Ok(())
 }
 
 async fn gateway_run(bind_override: Option<String>) -> Result<()> {
@@ -985,7 +1172,11 @@ async fn build_runtime(paths: &ProjectPaths, config: &GoldClawConfig) -> Result<
     let soul_path = paths.soul_path();
 
     let builtin_tools: Vec<std::sync::Arc<dyn BuiltinTool>> = vec![
-        std::sync::Arc::new(ReadWorkspaceTool::new(read_roots)),
+        std::sync::Arc::new(ReadWorkspaceTool::new(read_roots.clone())),
+        std::sync::Arc::new(WriteFileTool::new(read_roots.clone())),
+        std::sync::Arc::new(EditFileTool::new(read_roots)),
+        std::sync::Arc::new(BashExecTool::new()),
+        std::sync::Arc::new(BashCheckTool::new()),
         std::sync::Arc::new(UpdateSoulTool::new(soul_path.clone())),
     ];
     let message_builder = build_message_builder(paths);
@@ -1011,7 +1202,14 @@ async fn build_runtime(paths: &ProjectPaths, config: &GoldClawConfig) -> Result<
     InMemoryRuntime::with_store_and_memory(
         message_builder,
         provider,
-        std::sync::Arc::new(StaticPolicy::allow_only(["read_file", "update_soul"])),
+        std::sync::Arc::new(StaticPolicy::allow_only([
+            "read_file",
+            "write_file",
+            "edit_file",
+            "bash_exec",
+            "bash_check",
+            "update_soul",
+        ])),
         builtin_tools,
         sqlite,
         embedding_provider,

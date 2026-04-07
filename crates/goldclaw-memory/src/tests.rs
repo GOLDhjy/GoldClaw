@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::SqliteMemoryStore;
 
 fn sparse_embedding(index: usize) -> Vec<f32> {
-    let mut embedding = vec![0.0_f32; 2048];
+    let mut embedding = vec![0.0_f32; crate::MEMORY_VEC_DIMENSIONS];
     embedding[index] = 1.0;
     embedding
 }

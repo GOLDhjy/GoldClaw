@@ -29,7 +29,7 @@ mod migrations {
 
     #[test]
     fn schema_version_tracks_latest_migration() {
-        assert_eq!(current_schema_version(), 4);
+        assert_eq!(current_schema_version(), 5);
     }
 
     #[test]

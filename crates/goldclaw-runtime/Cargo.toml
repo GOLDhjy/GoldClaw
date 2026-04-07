@@ -9,6 +9,7 @@ publish = false
 async-trait.workspace = true
 chrono.workspace = true
 goldclaw-core = { path = "../goldclaw-core" }
+regex.workspace = true
 goldclaw-memory = { path = "../goldclaw-memory" }
 goldclaw-store = { path = "../goldclaw-store" }
 serde.workspace = true

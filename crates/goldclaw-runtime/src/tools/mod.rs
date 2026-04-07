@@ -1,8 +1,14 @@
+mod bash_exec;
+mod edit_file;
 mod read_file;
 mod update_soul;
+mod write_file;
 
+pub use bash_exec::{BashCheckTool, BashExecTool};
+pub use edit_file::EditFileTool;
 pub use read_file::ReadWorkspaceTool;
 pub use update_soul::UpdateSoulTool;
+pub use write_file::WriteFileTool;
 
 use async_trait::async_trait;
 use goldclaw_core::{Tool, ToolDefinition};

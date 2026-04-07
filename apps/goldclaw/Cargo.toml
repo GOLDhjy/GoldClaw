@@ -20,9 +20,11 @@ goldclaw-doctor = { path = "../../crates/goldclaw-doctor" }
 goldclaw-memory = { path = "../../crates/goldclaw-memory" }
 goldclaw-gateway = { path = "../../crates/goldclaw-gateway" }
 goldclaw-provider-glm = { path = "../../crates/goldclaw-provider-glm" }
+goldclaw-provider-qwen = { path = "../../crates/goldclaw-provider-qwen" }
 goldclaw-runtime = { path = "../../crates/goldclaw-runtime" }
 goldclaw-store = { path = "../../crates/goldclaw-store" }
 futures-util.workspace = true
+rusqlite.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

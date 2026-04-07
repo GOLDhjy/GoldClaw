@@ -150,12 +150,24 @@ pub struct RuntimeSettings {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProviderSettings {
-    /// BigModel (Zhipu AI) API key. Overridden by the `BIGMODEL_API_KEY` env var.
+    /// Chat provider: "glm" or "qwen". Defaults to "glm".
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    /// Model name, e.g. `GLM-5.1`. Overridden by the `BIGMODEL_MODEL` env var.
+    pub chat_provider: Option<String>,
+    /// Embedding provider: "qwen", "glm", or "none". Defaults to "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub embedding_provider: Option<String>,
+    /// BigModel (Zhipu AI) API key. Overridden by `BIGMODEL_API_KEY` env var.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "api_key")]
+    pub glm_api_key: Option<String>,
+    /// GLM model name, e.g. `GLM-5.1`. Overridden by `BIGMODEL_MODEL` env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glm_model: Option<String>,
+    /// DashScope (Qwen) API key. Overridden by `DASHSCOPE_API_KEY` env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qwen_api_key: Option<String>,
+    /// Qwen chat model name, e.g. `qwen-plus`. Overridden by `DASHSCOPE_MODEL` env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qwen_model: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

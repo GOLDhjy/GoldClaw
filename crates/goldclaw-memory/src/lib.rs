@@ -31,7 +31,7 @@ impl From<MemoryError> for GoldClawError {
 }
 
 type MemoryResult<T> = std::result::Result<T, MemoryError>;
-const MEMORY_VEC_DIMENSIONS: usize = 2048;
+pub const MEMORY_VEC_DIMENSIONS: usize = 1024;
 
 /// Standalone SQLite-backed memory store.
 ///
@@ -192,7 +192,8 @@ impl MemoryStore for SqliteMemoryStore {
     async fn recall(&self, query: MemoryQuery) -> Result<Vec<MemoryChunk>> {
         if let Some(embedding) = &query.embedding {
             match self.recall_vector_sync(embedding, query.limit) {
-                Ok(chunks) => return Ok(chunks),
+                Ok(chunks) if !chunks.is_empty() => return Ok(chunks),
+                Ok(_) => warn!("vector recall returned no hits, falling back to FTS5"),
                 Err(e) => warn!("vector recall failed, falling back to FTS5: {e}"),
             }
         }
@@ -273,6 +274,7 @@ INSERT INTO memory_vec_chunks(id, embedding)
 SELECT mc.id, mc.embedding
 FROM memory_chunks mc
 WHERE mc.embedding IS NOT NULL
+  AND length(mc.embedding) = {MEMORY_VEC_DIMENSIONS} * 4
   AND NOT EXISTS (
       SELECT 1
       FROM memory_vec_chunks mv
