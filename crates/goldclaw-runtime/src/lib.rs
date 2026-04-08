@@ -776,7 +776,7 @@ const RUNTIME_BASE_PROMPT: &str = "\
 
 如果用户消息里包含 [Memory] 块，这是从历史对话中召回的相关记忆片段。\
 请优先参考 [Memory] 中的信息来回答用户，即使你自己在当前对话中没有印象，\
-只要记忆块里有明确记录，就应当直接采用，不要说"不知道"或"没有记录"。";
+只要记忆块里有明确记录，就应当直接采用，不要说\"不知道\"或\"没有记录\"。";
 
 pub struct StandardMessageBuilder {
     system_prompt: Option<String>,
